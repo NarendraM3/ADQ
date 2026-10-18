@@ -1,0 +1,25 @@
+.adq-avatar{overflow:hidden;padding:0}
+.adq-avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%}
+.brand-symbol .brand-icon{width:54px;height:54px;display:grid;place-items:center;border:1px solid #ffffff16;border-radius:15px;background:#ffffff08;box-shadow:0 8px 26px #0003}
+.brand-symbol .brand-icon img{width:31px;height:31px;object-fit:contain}
+.platform-stage{background:radial-gradient(ellipse at 50% 57%,#13313b66,transparent 46%),radial-gradient(ellipse at 88% 10%,#16294a55,transparent 31%),#0b1120}
+.platform-stage .adq-stepper{width:100%;padding:23px 0 20px}
+.platform-stage .adq-step small{font-size:10px}
+.platform-stage .adq-content{width:min(1180px,100%)}
+.platform-stage .adq-heading{justify-content:center;text-align:center;margin:37px 0 30px}
+.platform-stage .adq-heading>div{display:grid;justify-items:center}
+.platform-stage .adq-heading .adq-eyebrow{display:none}
+.platform-stage .adq-heading h1{font-size:clamp(30px,3vw,40px);letter-spacing:-1.5px;margin:0 0 10px}
+.platform-stage .adq-heading p{font-size:14px}
+.platform-stage .adq-panel{min-height:0;flex:0;background:transparent;border:0;box-shadow:none;padding:0}
+.platform-stage .platform-grid{width:100%;max-width:1080px;gap:20px;margin:0 auto}
+.platform-stage .platform-choice{min-height:294px;padding:28px;background:linear-gradient(145deg,#162337d9,#111a29e8);backdrop-filter:blur(16px);border-color:#b8d4e01b;border-radius:16px;box-shadow:0 20px 60px #02071255,inset 0 1px #ffffff0e}
+.platform-stage .platform-choice:before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:radial-gradient(ellipse at 20% 0%,#ffffff09,transparent 55%)}
+.platform-stage .platform-choice:hover{transform:translateY(-4px);border-color:#21bdaa80;box-shadow:0 0 0 1px #14b8a61a,0 22px 52px #02071080,0 0 45px #14b8a610}
+.platform-stage .platform-tag{right:25px;top:31px}
+.platform-stage .platform-choice h2{font-size:20px;margin:25px 0 9px}
+.platform-stage .platform-choice p{font-size:13px;line-height:1.65;max-width:270px}
+.platform-stage .platform-choice button{min-height:43px;padding:0 18px;border-radius:8px}
+.platform-stage .adq-footer{display:none}
+@media(max-width:900px){.platform-stage .platform-grid{gap:13px}.platform-stage .platform-choice{min-height:275px;padding:20px}}
+@media(max-width:620px){.platform-stage .adq-stepper{padding:15px 0}.platform-stage .adq-heading{margin:25px 0 20px}.platform-stage .platform-grid{grid-template-columns:1fr}.platform-stage .platform-choice{min-height:220px;padding:22px}.platform-stage .platform-choice h2{margin-top:16px}}
