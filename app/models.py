@@ -63,6 +63,7 @@ class Execution(Base):
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     retry_of: Mapped[int | None] = mapped_column(ForeignKey("executions.id"), nullable=True)
+    rule_snapshot: Mapped[list | None] = mapped_column(JSON, nullable=True)
     passed_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     report_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)

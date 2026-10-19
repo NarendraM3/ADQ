@@ -1,5 +1,5 @@
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class JobCreate(BaseModel):
@@ -49,6 +49,21 @@ class CredentialCreate(BaseModel):
     provider: Literal["s3", "azure_blob", "onelake", "snowflake", "databricks", "fabric"]
     secrets: dict[str, Any]
     config: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_s3_connection(self):
+        if self.provider != "s3":
+            return self
+        if not self.config.get("bucket") or not self.config.get("region"):
+            raise ValueError("S3 connections require a bucket name and AWS region")
+        auth_method = self.config.get("auth_method", "access_key")
+        if auth_method not in ("access_key", "default_chain"):
+            raise ValueError("S3 auth_method must be access_key or default_chain")
+        if auth_method == "access_key" and (not self.secrets.get("access_key_id") or not self.secrets.get("secret_access_key")):
+            raise ValueError("Access key authentication requires an access key ID and secret access key")
+        if auth_method == "default_chain" and (self.secrets.get("access_key_id") or self.secrets.get("secret_access_key")):
+            raise ValueError("Do not include access keys when using default AWS credentials")
+        return self
 
 
 class CorrectionCreate(BaseModel):

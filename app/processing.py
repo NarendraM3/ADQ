@@ -1,13 +1,15 @@
-import csv, io, json
+﻿import csv, io, json
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
+from types import SimpleNamespace
 from sqlalchemy import select
 from app.config import settings
 from app.connectors.storage import LocalStorage
 from app.connectors.destinations import write_destination
 from app.database import SessionLocal
 from app.models import Credential, Dataset, Execution, Job, Rule
-from app.rules import validate_records
+from app.rules import is_missing, rule_signature, validate_records
 
 
 def parse_data(filename: str, content: bytes):
@@ -99,19 +101,55 @@ def execute(execution_id: int):
                     chosen.add(output_col)
                 seen_columns.update((dataset.schema_json or {}).get("columns",{}).keys())
             records = [{k:v for k,v in row.items() if k in chosen} for row in records]
-        rules = list(db.scalars(select(Rule).where(Rule.job_id == job.id)))
-        passed, failed = validate_records(records, rules)
+        if execution.rule_snapshot is not None:
+            rules = [SimpleNamespace(**item) for item in execution.rule_snapshot]
+        else:  # Backwards compatibility for executions queued before migration.
+            rules = list(db.scalars(select(Rule).where(Rule.job_id == job.id)))
+        # One check may have been suggested more than once with different
+        # explanatory metadata. Count and execute only distinct enabled,
+        # approved rules; pending and disabled checks must never validate data.
+        active_rules = [r for r in rules if r.enabled and r.approved]
+        signatures = {rule_signature(r) for r in active_rules}
+        executed_count = len(signatures)
+        pending_count = sum(not bool(r.approved) for r in rules)
+        disabled_count = sum(not bool(r.enabled) for r in rules)
+        skipped_count = sum(not (r.enabled and r.approved) for r in rules)
+        if executed_count:
+            passed, failed = validate_records(records, active_rules)
+        else:
+            # No executed rules means no record has been evaluated. Do not
+            # classify the untouched input rows as passing.
+            passed, failed = [], []
+        validation_complete = executed_count > 0
         base = f"outputs/job-{job.id}/execution-{execution.id}"
         dest = LocalStorage()
         passed_path = dest.save(base + "/passed.csv", encode_csv(passed))
         failed_path = dest.save(base + "/failed.json", json.dumps(failed, ensure_ascii=False, indent=2).encode())
+        report = {"execution_id": execution.id, "job_id": job.id,
+            "status": "succeeded" if validation_complete else "incomplete", "validation_complete": validation_complete,
+            "total": len(records) if validation_complete else 0,
+            "records_loaded": len(records), "records_evaluated": len(records) if validation_complete else 0,
+            "passed": len(passed), "failed": len(failed),
+            "rules": {"executed": executed_count, "pending": pending_count, "disabled": disabled_count, "skipped": skipped_count},
+            "passed_path": passed_path, "failed_path": failed_path,
+            "destination": destination.get("type", "local"), "generated_at": datetime.now(timezone.utc).isoformat()}
+        if not validation_complete:
+            report["message"] = "Validation incomplete: no approved rules were executed. Records were not validated."
+            report_path = dest.save(base + "/report.json", json.dumps(report, indent=2).encode())
+            execution.status = "incomplete"
+            execution.passed_count = execution.failed_count = 0
+            execution.report_path = report_path
+            execution.logs = ["Execution started", f"Loaded {len(records)} records",
+                f"Executed 0 approved and enabled rules; skipped {skipped_count} rules ({pending_count} pending, {disabled_count} disabled; categories can overlap)",
+                report["message"]]
+            execution.finished_at = datetime.now(timezone.utc)
+            db.commit()
+            return
         output_columns=list(dict.fromkeys(k for row in passed for k in row))
-        output_schema={"columns":{c:{"inferred_type":"string","nullable":any(r.get(c) in (None,"") for r in passed)} for c in output_columns},"row_count":len(passed)}
+        output_schema={"columns":{c:{"inferred_type":"string","nullable":any(is_missing(r.get(c)) for r in passed)} for c in output_columns},"row_count":len(passed)}
         output_dataset=Dataset(name=f"{job.name} output {execution.id}",filename="passed.csv",path=passed_path,source_type="derived",schema_json=output_schema)
         db.add(output_dataset); db.flush()
-        report = {"execution_id": execution.id, "job_id": job.id, "status": "succeeded", "total": len(records),
-            "passed": len(passed), "failed": len(failed), "output_dataset_id": output_dataset.id, "passed_path": passed_path, "failed_path": failed_path,
-            "destination": destination.get("type", "local"), "generated_at": datetime.now(timezone.utc).isoformat()}
+        report["output_dataset_id"] = output_dataset.id
         provider=destination.get("type","local")
         secrets={}
         if provider != "local":
@@ -130,14 +168,17 @@ def execute(execution_id: int):
         # Persist the final report locally after the real destination operation has completed.
         report_path = dest.save(base + "/report.json", json.dumps(report, indent=2).encode())
         execution.status = "succeeded"; execution.passed_count = len(passed); execution.failed_count = len(failed)
-        execution.report_path = report_path; execution.logs = ["Execution started", f"Loaded {len(records)} records", f"Passed {len(passed)}; failed {len(failed)}", "Outputs saved locally"]
+        execution.report_path = report_path; execution.logs = ["Execution started", f"Loaded {len(records)} records",
+            f"Executed {executed_count} approved and enabled rules; skipped {pending_count} pending rules; {disabled_count} disabled rules",
+            f"Passed {len(passed)}; failed {len(failed)}", "Outputs saved locally"]
         execution.finished_at = datetime.now(timezone.utc); db.commit()
     except Exception as exc:
+        logging.getLogger(__name__).error("Execution %s failed (%s)", execution_id, type(exc).__name__)
         db.rollback()
         execution = db.get(Execution, execution_id)
         if execution:
-            execution.status = "failed"; execution.error = "Execution failed. Verify the job configuration and connected provider."; execution.finished_at = datetime.now(timezone.utc)
-            execution.logs = (execution.logs or []) + ["Execution failed; details omitted to protect connection credentials."]
+            execution.status = "failed"; execution.error = f"Execution failed ({type(exc).__name__}). Verify the job configuration and connected provider."; execution.finished_at = datetime.now(timezone.utc)
+            execution.logs = (execution.logs or []) + [f"Execution failed with {type(exc).__name__}; see backend logs for the diagnostic."]
             db.commit()
     finally:
         db.close()

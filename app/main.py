@@ -1,4 +1,4 @@
-import json, logging, mimetypes
+import json, logging, mimetypes, re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
@@ -24,6 +24,9 @@ async def lifespan(app):
         if "settings" not in {column["name"] for column in inspect(engine).get_columns("jobs")}:
             with engine.begin() as connection:
                 connection.exec_driver_sql("ALTER TABLE jobs ADD COLUMN settings JSON NOT NULL DEFAULT '{}'")
+        if "rule_snapshot" not in {column["name"] for column in inspect(engine).get_columns("executions")}:
+            with engine.begin() as connection:
+                connection.exec_driver_sql("ALTER TABLE executions ADD COLUMN rule_snapshot JSON")
     yield
 
 
@@ -36,10 +39,13 @@ def not_found(obj, name):
 
 
 def credential_key():
-    if not settings.secret_encryption_key:
-        raise HTTPException(503, "Credential storage is disabled. Set SECRET_ENCRYPTION_KEY to a valid Fernet key.")
-    try: return Fernet(settings.secret_encryption_key.encode())
-    except Exception as e: raise HTTPException(503, "SECRET_ENCRYPTION_KEY is invalid") from e
+    key = settings.secret_encryption_key
+    if not key:
+        raise HTTPException(503, "Credential storage is unavailable: SECRET_ENCRYPTION_KEY is missing or empty. Set it in the project .env or backend environment.")
+    try:
+        return Fernet(key.strip().encode("ascii"))
+    except (UnicodeEncodeError, TypeError, ValueError) as e:
+        raise HTTPException(503, "Credential storage is unavailable: SECRET_ENCRYPTION_KEY is not a valid Fernet key. Check its format and whether the backend environment overrides the project .env.") from e
 
 
 def sensitive_config_keys(value, prefix=""):
@@ -170,8 +176,8 @@ def create_job_configuration(body: JobConfiguration, db: Session = Depends(get_d
     for rule in body.rules:
         values = rule.model_dump()
         values["rule_type"] = values["rule_type"].upper()
-        values["enabled"] = True
-        values["approved"] = True
+        values["enabled"] = bool(values["enabled"])
+        values["approved"] = bool(values["approved"])
         db.add(Rule(job_id=job.id, **values))
     db.commit()
     db.refresh(job)
@@ -192,8 +198,8 @@ def replace_job_configuration(job_id: int, body: JobConfiguration, db: Session =
     for rule in body.rules:
         values = rule.model_dump()
         values["rule_type"] = values["rule_type"].upper()
-        values["enabled"] = True
-        values["approved"] = True
+        values["enabled"] = bool(values["enabled"])
+        values["approved"] = bool(values["approved"])
         db.add(Rule(job_id=job_id, **values))
     db.commit()
     db.refresh(job)
@@ -247,6 +253,59 @@ def list_rules(job_id: int, db: Session = Depends(get_db)):
     return db.scalars(select(Rule).where(Rule.job_id == job_id).order_by(Rule.id)).all()
 
 
+@app.post("/api/v1/jobs/{job_id}/baseline-rules", status_code=201)
+def add_employee_baseline_rules(job_id: int, db: Session = Depends(get_db)):
+    """Idempotently add the application's documented employee baseline checks.
+
+    These fixed product rules are distinct from AI suggestions and are active
+    only when the user explicitly adds them from the rule review screen.
+    Existing rules and their approval decisions are never edited.
+    """
+    job = not_found(db.get(Job, job_id), "Job")
+    if len(job.dataset_ids) != 1:
+        raise HTTPException(422, "Employee baseline rules require a job with one dataset")
+    dataset = not_found(db.get(Dataset, job.dataset_ids[0]), "Dataset")
+    required = ["EmployeeID", "Name", "Email", "Age", "Department", "Salary"]
+    schema_columns = (dataset.schema_json or {}).get("columns", {})
+    if any(column not in schema_columns for column in required):
+        raise HTTPException(422, "Dataset must contain EmployeeID, Name, Email, Age, Department, and Salary")
+    selected = (job.selected_columns or {}).get(str(dataset.id), list(schema_columns))
+    if any(column not in selected for column in required):
+        raise HTTPException(422, "Select all six employee baseline columns before adding baseline rules")
+
+    baseline_id = "employee-v1"
+    definitions = [
+        (column, "NOT_NULL", {}) for column in required
+    ] + [
+        ("Email", "EMAIL_FORMAT", {}),
+        ("Age", "DATA_TYPE", {"type": "number"}),
+        ("Age", "RANGE", {"min": 0}),
+        ("Salary", "DATA_TYPE", {"type": "number"}),
+        ("Salary", "RANGE", {"min": 0}),
+        ("Department", "IN_SET", {"values": ["IT", "HR", "Finance", "Engineering", "Operations", "Marketing"], "case_sensitive": False}),
+        ("EmployeeID", "UNIQUE", {}),
+    ]
+    existing = list(db.scalars(select(Rule).where(Rule.job_id == job.id)))
+    known = {(r.dataset_id, r.column_name, r.rule_type.upper(),
+              json.dumps({k:v for k,v in (r.parameters or {}).items() if k not in {"severity", "rationale"}}, sort_keys=True))
+             for r in existing if (r.parameters or {}).get("baseline_id") == baseline_id}
+    added = []
+    for column, kind, params in definitions:
+        marked = {**params, "baseline_id": baseline_id}
+        key = (dataset.id, column, kind, json.dumps(marked, sort_keys=True))
+        if key in known:
+            continue
+        rule = Rule(job_id=job.id, dataset_id=dataset.id, column_name=column, rule_type=kind,
+                    parameters=marked, enabled=True, approved=True)
+        db.add(rule)
+        added.append(rule)
+    db.commit()
+    for rule in added:
+        db.refresh(rule)
+    return {"baseline_id": baseline_id, "added": len(added), "rules": added,
+            "note": "Product-defined employee baseline rules are enabled and approved. AI suggestions still require review."}
+
+
 @app.post("/api/v1/jobs/{job_id}/rules", status_code=201)
 def create_rule(job_id: int, body: RuleCreate, db: Session = Depends(get_db)):
     job=not_found(db.get(Job, job_id), "Job")
@@ -286,23 +345,118 @@ def delete_rule(rule_id: int, db: Session = Depends(get_db)):
 @app.post("/api/v1/jobs/{job_id}/suggest-rules")
 async def suggest_rules(job_id: int, db: Session = Depends(get_db)):
     job = not_found(db.get(Job, job_id), "Job")
+    datasets = [not_found(db.get(Dataset, did), "Dataset") for did in job.dataset_ids]
+    suggestions = await generate_rule_suggestions(datasets, db)
+    existing = list(db.scalars(select(Rule).where(Rule.job_id == job_id)))
+    existing_keys = {rule_key(r.dataset_id, r.column_name, r.rule_type, r.parameters) for r in existing}
+    added = []
+    for item in suggestions:
+        params = item["parameters"]
+        key = rule_key(item["dataset_id"], item["column_name"], item["rule_type"], params)
+        if key in existing_keys: continue
+        existing_keys.add(key)
+        rule = Rule(job_id=job.id, dataset_id=item["dataset_id"], column_name=item["column_name"],
+                    rule_type=item["rule_type"], parameters={**params, "severity": item["severity"], "rationale": item["rationale"]},
+                    enabled=True, approved=False)
+        db.add(rule); added.append(rule)
+    db.commit()
+    for rule in added: db.refresh(rule)
+    return {"provider":settings.ai_provider,"model":settings.resolved_ai_model,"suggestions":added,"saved":True,"added":len(added),"note":"AI-generated rules are pending review and approval."}
+
+
+@app.post("/api/v1/datasets/{dataset_id}/suggest-rules")
+async def suggest_dataset_rules(dataset_id: int, db: Session = Depends(get_db)):
+    dataset = not_found(db.get(Dataset, dataset_id), "Dataset")
+    suggestions = await generate_rule_suggestions([dataset], db)
+    return {"provider":settings.ai_provider,"model":settings.resolved_ai_model,"suggestions":suggestions,"saved":False}
+
+
+def rule_key(dataset_id, column_name, rule_type, parameters):
+    relevant = {k:v for k,v in (parameters or {}).items() if k not in {"severity", "rationale"}}
+    return (dataset_id, column_name, rule_type.upper(), json.dumps(relevant, sort_keys=True, default=str))
+
+
+def _negative_age_range_suggestions(profile, suggestions):
+    """Add a deterministic non-negative bound when observed age data is negative."""
+    age_names = {"age", "customer_age", "age_years", "years_old"}
+    for dataset in profile:
+        for column, metadata in dataset.get("columns", {}).items():
+            if column.lower() not in age_names:
+                continue
+            if str(metadata.get("inferred_type", "")).lower() not in {"int", "integer", "float", "number", "decimal"}:
+                continue
+            try:
+                has_negative = any(float(value) < 0 for value in metadata.get("distinct_sample", []))
+            except (TypeError, ValueError):
+                continue
+            if not has_negative:
+                continue
+            has_nonnegative_bound = any(
+                item.get("dataset_id") == dataset["dataset_id"]
+                and item.get("column_name") == column
+                and item.get("rule_type") == "RANGE"
+                and item.get("parameters", {}).get("min") is not None
+                and float(item["parameters"]["min"]) >= 0
+                for item in suggestions
+            )
+            if not has_nonnegative_bound:
+                suggestions.append({"dataset_id": dataset["dataset_id"], "column_name": column,
+                    "rule_type": "RANGE", "parameters": {"min": 0}, "severity": "high",
+                    "rationale": "Observed negative age values; age must be non-negative."})
+    return suggestions
+
+
+def _safe_provider_error(response, api_key):
+    """Extract a short provider diagnostic without returning credential material."""
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        detail = error.get("message") or error.get("type") or error.get("code")
+    elif isinstance(error, str):
+        detail = error
+    else:
+        detail = None
+    if not detail:
+        detail = response.text
+    detail = str(detail)
+    detail = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", detail)
+    detail = re.sub(r"(?i)(api[_ -]?key|access[_ -]?token|client[_ -]?secret)\s*[:=]\s*\S+", r"\1=[redacted]", detail)
+    detail = re.sub(r"(?i)\b(gsk_[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+)\b", "[redacted]", detail)
+    if api_key:
+        detail = detail.replace(api_key, "[redacted]")
+    return detail[:500].strip() or "No error details returned"
+
+
+async def generate_rule_suggestions(datasets, db):
     ai_base_url=settings.resolved_ai_base_url
     ai_api_key=settings.resolved_ai_api_key
     ai_model=settings.resolved_ai_model
     if settings.ai_provider == "none" or not ai_api_key or not ai_model or not ai_base_url:
-        raise HTTPException(503, "AI rule suggestions are disabled; configure AI_PROVIDER, AI_API_KEY, AI_MODEL, and AI_BASE_URL for custom providers")
+        raise HTTPException(503, "AI rule suggestions are disabled; configure the AI provider, API key, model, and endpoint")
     import httpx
     profile = []
     local = LocalStorage()
-    for did in job.dataset_ids:
-        ds = db.get(Dataset, did)
-        rows = parse_data(ds.filename, local.read(ds.path))
-        cols = {}
-        for c in (ds.schema_json or {}).get("columns", {}):
-            vals = [r.get(c) for r in rows]
-            cols[c] = {"inferred_type": infer_type(vals), "null_fraction": sum(v in (None, "") for v in vals)/max(len(vals),1), "distinct_sample": list(dict.fromkeys(str(v) for v in vals if v not in (None,"")))[:10]}
-        profile.append({"dataset_id": did, "row_count": len(rows), "columns": cols})
-    prompt = {"task":"Suggest data quality rules grounded only in this schema and profile. Return a JSON object with a suggestions array. Each item: dataset_id, column_name, rule_type from supported list, parameters, rationale. Do not invent columns or values.", "supported_rule_types":sorted(RULE_TYPES), "profile":profile}
+    for ds in datasets:
+        schema = ds.schema_json or {}
+        cols = {c:dict(meta) for c,meta in schema.get("columns",{}).items()}
+        # Profile local file rows where available. Connector datasets already carry schema metadata;
+        # never assume their remote paths can be read through local storage.
+        if ds.source_type in {"local", "upload"}:
+            try:
+                rows = parse_data(ds.filename, local.read(ds.path))
+                for c, meta in cols.items():
+                    vals = [r.get(c) for r in rows]
+                    meta.update({"inferred_type":infer_type(vals),"null_fraction":sum(v in (None, "") for v in vals)/max(len(vals),1),
+                                 "distinct_sample":list(dict.fromkeys(str(v) for v in vals if v not in (None,"")))[:10]})
+                schema["row_count"] = len(rows)
+            except (OSError, ValueError):
+                pass
+        profile.append({"dataset_id": ds.id, "dataset_name": ds.name, "source_type": ds.source_type,
+                        "row_count": schema.get("row_count"), "metadata":{k:v for k,v in schema.items() if k != "columns"}, "columns": cols})
+    prompt = {"task":"Suggest relevant data quality rules grounded only in the provided schema metadata and profile. Return JSON with a suggestions array. Each item: dataset_id, column_name, rule_type, parameters, severity (low, medium, high, critical), rationale. Use only real columns and supported rule types. Inspect distinct_sample values for observed anomalies: when a semantically non-negative numeric field (for example age) contains a negative sample, include a RANGE rule with min 0; do not treat DATA_TYPE alone as sufficient. Do not guess other ranges or accepted values unless supported by profile evidence. Use NOT_NULL, UNIQUE, DATA_TYPE, RANGE, EMAIL_FORMAT, REGEX, LENGTH, or IN_SET as appropriate.", "supported_rule_types":sorted(RULE_TYPES), "profile":profile}
     url = ai_base_url.rstrip("/") + "/chat/completions"
     try:
         async with httpx.AsyncClient(timeout=settings.ai_timeout_seconds) as client:
@@ -314,18 +468,65 @@ async def suggest_rules(job_id: int, db: Session = Depends(get_db)):
         elif isinstance(result,dict): suggestions=result.get("suggestions",[])
         else: raise ValueError("Expected an object with a suggestions array")
         if not isinstance(suggestions,list): raise ValueError("AI response suggestions field must be an array")
+        known = {ds.id:set((ds.schema_json or {}).get("columns",{})) for ds in datasets}
+        clean=[]
+        if len(suggestions) > 200: raise ValueError("Too many suggestions")
         for item in suggestions:
-            if item.get("rule_type", "").upper() not in RULE_TYPES or int(item.get("dataset_id", -1)) not in job.dataset_ids:
-                raise ValueError("AI response contained an unsupported rule or dataset")
-        return {"provider":settings.ai_provider,"model":ai_model,"suggestions":suggestions,"saved":False,"note":"Review suggestions and create/approve rules explicitly."}
-    except httpx.HTTPError as e: raise HTTPException(502, "AI provider request failed; check the configured endpoint and credentials") from e
-    except (KeyError, ValueError, TypeError) as e: raise HTTPException(502, "AI provider returned an invalid response") from e
+            if not isinstance(item,dict): raise ValueError("Suggestion must be an object")
+            did=int(item.get("dataset_id", -1)); column=item.get("column_name"); kind=str(item.get("rule_type", "")).upper()
+            params=item.get("parameters", {})
+            if did not in known or column not in known[did] or kind not in RULE_TYPES or not isinstance(params,dict):
+                raise ValueError("AI response referenced an unknown column or unsupported rule")
+            validate_rule_definition(kind, params)
+            severity=str(item.get("severity", "medium")).lower()
+            if severity not in {"low","medium","high","critical"}: raise ValueError("Invalid severity")
+            clean.append({"dataset_id":did,"column_name":column,"rule_type":kind,"parameters":params,
+                          "severity":severity,"rationale":str(item.get("rationale", "Suggested from schema metadata"))[:500]})
+        return _negative_age_range_suggestions(profile, clean)
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        request_id = e.response.headers.get("x-request-id") or e.response.headers.get("x-groq-id")
+        provider_detail = _safe_provider_error(e.response, ai_api_key)
+        logging.getLogger(__name__).warning(
+            "AI provider returned HTTP %s (provider=%s model=%s request_id=%s detail=%s)",
+            status, settings.ai_provider, ai_model, request_id or "unavailable", provider_detail,
+        )
+        if status == 401:
+            raise HTTPException(502, f"AI provider returned HTTP 401 (invalid API key): {provider_detail}") from e
+        if status == 403:
+            raise HTTPException(502, f"AI provider returned HTTP 403 (permission or model access issue): {provider_detail}") from e
+        if status == 429:
+            raise HTTPException(503, f"AI provider returned HTTP 429 (rate limit or quota issue): {provider_detail}") from e
+        if status == 400:
+            raise HTTPException(502, f"AI provider returned HTTP 400 (invalid request or unsupported parameter): {provider_detail}") from e
+        if status == 404:
+            raise HTTPException(502, f"AI provider returned HTTP 404 (endpoint or model unavailable): {provider_detail}") from e
+        if status == 422:
+            raise HTTPException(502, f"AI provider returned HTTP 422 (request validation failed): {provider_detail}") from e
+        if status >= 500:
+            raise HTTPException(503, f"AI provider returned HTTP {status} (provider-side failure): {provider_detail}") from e
+        raise HTTPException(502, f"AI provider returned HTTP {status}: {provider_detail}") from e
+    except httpx.TimeoutException as e:
+        logging.getLogger(__name__).warning("AI provider request timed out (provider=%s model=%s)", settings.ai_provider, ai_model)
+        raise HTTPException(504, "AI provider request timed out; try again") from e
+    except httpx.RequestError as e:
+        logging.getLogger(__name__).warning(
+            "AI provider connection failed (provider=%s model=%s error=%s)",
+            settings.ai_provider, ai_model, type(e).__name__,
+        )
+        raise HTTPException(502, "Could not connect to the AI provider; verify the endpoint and network access") from e
+    except (KeyError, ValueError, TypeError) as e:
+        logging.getLogger(__name__).warning(
+            "AI provider returned an invalid response (provider=%s model=%s error=%s)",
+            settings.ai_provider, ai_model, type(e).__name__,
+        )
+        raise HTTPException(502, "AI provider returned an invalid response; no rules were created") from e
 
 
 @app.post("/api/v1/jobs/{job_id}/execute", status_code=202)
 def run_job(job_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
     not_found(db.get(Job, job_id), "Job")
-    record = Execution(job_id=job_id, status="queued")
+    record = Execution(job_id=job_id, status="queued", rule_snapshot=rule_snapshot(db, job_id))
     db.add(record); db.commit(); db.refresh(record)
     tasks.add_task(execute, record.id)
     return record
@@ -335,7 +536,8 @@ def run_job(job_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
 def retry_execution(execution_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
     previous=not_found(db.get(Execution,execution_id),"Execution")
     if previous.status != "failed": raise HTTPException(409,"Only failed executions can be retried")
-    retry=Execution(job_id=previous.job_id,status="queued",attempt=previous.attempt+1,retry_of=previous.id)
+    retry=Execution(job_id=previous.job_id,status="queued",attempt=previous.attempt+1,retry_of=previous.id,
+                    rule_snapshot=previous.rule_snapshot if previous.rule_snapshot is not None else rule_snapshot(db, previous.job_id))
     db.add(retry);db.commit();db.refresh(retry);tasks.add_task(execute,retry.id);return retry
 
 
@@ -343,6 +545,15 @@ def retry_execution(execution_id: int, tasks: BackgroundTasks, db: Session = Dep
 def job_executions(job_id: int, db: Session = Depends(get_db)):
     not_found(db.get(Job, job_id), "Job")
     return db.scalars(select(Execution).where(Execution.job_id == job_id).order_by(Execution.id.desc())).all()
+
+
+def rule_snapshot(db: Session, job_id: int):
+    """Capture every rule and its lifecycle state when a run is requested."""
+    rules = db.scalars(select(Rule).where(Rule.job_id == job_id).order_by(Rule.id)).all()
+    return [{"id": r.id, "job_id": r.job_id, "dataset_id": r.dataset_id,
+             "column_name": r.column_name, "rule_type": r.rule_type,
+             "parameters": r.parameters or {}, "enabled": bool(r.enabled),
+             "approved": bool(r.approved)} for r in rules]
 
 
 @app.get("/api/v1/executions/{execution_id}")
@@ -396,7 +607,12 @@ def revalidate(execution_id: int, db: Session = Depends(get_db)):
     path=Path(e.report_path).parent / "failed.json"
     rows=json.loads(LocalStorage().read(str(path)))
     records=[r["record"] for r in rows]
-    job=db.get(Job,e.job_id); rules=list(db.scalars(select(Rule).where(Rule.job_id==job.id)))
+    job=db.get(Job,e.job_id)
+    if e.rule_snapshot is not None:
+        from types import SimpleNamespace
+        rules=[SimpleNamespace(**item) for item in e.rule_snapshot]
+    else:
+        rules=list(db.scalars(select(Rule).where(Rule.job_id==job.id)))
     from app.rules import validate_records
     passed,failed=validate_records(records,rules)
     root=Path(settings.local_data_dir).resolve(); base=Path(e.report_path).parent
@@ -428,13 +644,37 @@ def connect_source(body: CredentialCreate, prefix: str = "", db: Session = Depen
     provider = "onelake" if body.provider == "fabric" else body.provider
     if provider not in ("s3", "azure_blob", "onelake", "databricks", "snowflake"):
         raise HTTPException(400, "Choose a supported data source")
+    if provider == "s3":
+        auth_method = body.config.get("auth_method", "access_key")
+        if auth_method not in ("access_key", "default_chain"):
+            raise HTTPException(422, "Choose access key or IAM role authentication")
+        if not body.config.get("bucket") or not body.config.get("region"):
+            raise HTTPException(422, "Enter the S3 bucket name and AWS region")
+        if auth_method == "access_key" and (not body.secrets.get("access_key_id") or not body.secrets.get("secret_access_key")):
+            raise HTTPException(422, "Enter an access key ID and secret access key")
+        if auth_method == "default_chain" and (body.secrets.get("access_key_id") or body.secrets.get("secret_access_key")):
+            raise HTTPException(422, "Remove access keys when using IAM role authentication")
     adapter = None
     try:
         adapter = get_source_adapter(provider, body.config, body.secrets)
         files = adapter.list_files(prefix)
-        if files:
+        if files and provider != "s3":
             adapter.check_read(files[0]["name"])
     except Exception as e:
+        if provider == "s3":
+            response = getattr(e, "response", {})
+            code = str(response.get("Error", {}).get("Code", "")) if isinstance(response, dict) else ""
+            if code in ("InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken", "ExpiredToken", "UnrecognizedClientException"):
+                raise HTTPException(401, "AWS rejected the supplied credentials. Check the access key ID, secret key, and session token.") from e
+            if code in ("AccessDenied", "403", "Forbidden"):
+                raise HTTPException(403, "AWS credentials do not have permission to inspect this bucket. Grant s3:ListBucket and bucket access.") from e
+            if code in ("NoSuchBucket", "404", "NotFound"):
+                raise HTTPException(404, "The S3 bucket was not found. Check the bucket name and AWS region.") from e
+            if code in ("PermanentRedirect", "301", "AuthorizationHeaderMalformed"):
+                raise HTTPException(400, "The bucket is in a different AWS region. Select its correct region.") from e
+            if isinstance(e, RuntimeError) and "boto3" in str(e).lower():
+                raise HTTPException(503, "S3 support is unavailable. Install the cloud dependencies (pip install .[cloud]) and restart the backend.") from e
+            raise HTTPException(400, "Could not connect to S3; verify the bucket, region, and AWS credentials.") from e
         raise HTTPException(400, "Could not connect or list files; verify the source settings and credentials") from e
     finally:
         if adapter and hasattr(adapter, "close"): adapter.close()

@@ -30,11 +30,25 @@ class S3Storage:
             import boto3
         except ImportError as e:
             raise RuntimeError("S3 integration requires optional dependencies: pip install .[cloud]") from e
-        self.client = boto3.client("s3", aws_access_key_id=credentials.get("access_key_id"),
-            aws_secret_access_key=credentials.get("secret_access_key"), region_name=config.get("region"))
+        auth_method = config.get("auth_method", "access_key")
+        if auth_method == "access_key":
+            access_key = credentials.get("access_key_id")
+            secret_key = credentials.get("secret_access_key")
+            if not access_key or not secret_key:
+                raise ValueError("Access key authentication requires an access key ID and secret access key")
+            self.client = boto3.client("s3", aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key, aws_session_token=credentials.get("session_token"),
+                region_name=config.get("region"))
+        elif auth_method == "default_chain":
+            # Use the deployment's IAM role or standard AWS credential provider chain.
+            self.client = boto3.client("s3", region_name=config.get("region"))
+        else:
+            raise ValueError("Choose access key or IAM role authentication")
         self.bucket = config.get("bucket")
-        if not self.bucket:
-            raise ValueError("S3 config requires bucket")
+        if not self.bucket or not config.get("region"):
+            raise ValueError("S3 config requires bucket and AWS region")
+        # Validate bucket access before listing objects so empty buckets also validate.
+        self.client.head_bucket(Bucket=self.bucket)
 
     def read(self, key: str) -> bytes:
         return self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
