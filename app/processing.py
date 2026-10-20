@@ -184,7 +184,11 @@ def execute(execution_id: int):
         # One check may have been suggested more than once with different
         # explanatory metadata. Count and execute only distinct enabled,
         # approved rules; pending and disabled checks must never validate data.
-        active_rules = [r for r in rules if r.enabled and r.approved]
+        selected_columns = job.selected_columns or {}
+        selected_for = lambda dataset: selected_columns.get(str(dataset.id), list((dataset.schema_json or {}).get("columns", {})))
+        active_rules = [r for r in rules if r.enabled and r.approved and
+                        (r.column_name in selected_for(next((d for d in datasets if d.id == r.dataset_id), datasets[0])) if r.dataset_id is not None
+                         else any(r.column_name in selected_for(dataset) for dataset in datasets))]
         validate_rule_bindings(active_rules, job.dataset_ids,
                                {dataset.id: rows for dataset, rows in zip(datasets, record_sets)}, records)
         signatures = {rule_signature(r) for r in active_rules}

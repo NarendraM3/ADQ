@@ -494,7 +494,7 @@ def delete_rule(rule_id: int, db: Session = Depends(get_db)):
 async def suggest_rules(job_id: int, db: Session = Depends(get_db)):
     job = not_found(db.get(Job, job_id), "Job")
     datasets = [not_found(db.get(Dataset, did), "Dataset") for did in job.dataset_ids]
-    suggestions = await generate_rule_suggestions(datasets, db)
+    suggestions = await generate_rule_suggestions(datasets, db, job.selected_columns or {})
     existing = list(db.scalars(select(Rule).where(Rule.job_id == job_id)))
     existing_keys = {rule_key(r.dataset_id, r.column_name, r.rule_type, r.parameters) for r in existing}
     added = []
@@ -578,7 +578,7 @@ def _safe_provider_error(response, api_key):
     return detail[:500].strip() or "No error details returned"
 
 
-async def generate_rule_suggestions(datasets, db):
+async def generate_rule_suggestions(datasets, db, selected_columns=None):
     ai_base_url=settings.resolved_ai_base_url
     ai_api_key=settings.resolved_ai_api_key
     ai_model=settings.resolved_ai_model
@@ -589,7 +589,8 @@ async def generate_rule_suggestions(datasets, db):
     local = LocalStorage()
     for ds in datasets:
         schema = ds.schema_json or {}
-        cols = {c:dict(meta) for c,meta in schema.get("columns",{}).items()}
+        allowed = (selected_columns or {}).get(str(ds.id))
+        cols = {c:dict(meta) for c,meta in schema.get("columns",{}).items() if allowed is None or c in allowed}
         # Profile local file rows where available. Connector datasets already carry schema metadata;
         # never assume their remote paths can be read through local storage.
         if ds.source_type in {"local", "upload"}:
@@ -616,7 +617,7 @@ async def generate_rule_suggestions(datasets, db):
         elif isinstance(result,dict): suggestions=result.get("suggestions",[])
         else: raise ValueError("Expected an object with a suggestions array")
         if not isinstance(suggestions,list): raise ValueError("AI response suggestions field must be an array")
-        known = {ds.id:set((ds.schema_json or {}).get("columns",{})) for ds in datasets}
+        known = {ds.id:set((ds.schema_json or {}).get("columns",{})) & set((selected_columns or {}).get(str(ds.id), (ds.schema_json or {}).get("columns",{}))) for ds in datasets}
         clean=[]
         if len(suggestions) > 200: raise ValueError("Too many suggestions")
         for item in suggestions:
