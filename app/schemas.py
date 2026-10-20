@@ -1,5 +1,30 @@
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+PLATFORM_NAMES = {
+    "databricks": "Databricks",
+    "snowflake": "Snowflake",
+    "microsoft fabric": "Microsoft Fabric",
+    "microsoftfabric": "Microsoft Fabric",
+    "fabric": "Microsoft Fabric",
+    "onelake": "Microsoft Fabric",
+    "local": "Local",
+    "s3": "Amazon S3",
+    "amazon s3": "Amazon S3",
+    "azure_blob": "Azure Blob Storage",
+    "azure blob": "Azure Blob Storage",
+    "azure blob storage": "Azure Blob Storage",
+}
+
+
+def normalize_platform(value: str | None) -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        return value
+    normalized = " ".join(value.strip().replace("_", " ").split()).casefold()
+    return PLATFORM_NAMES.get(normalized, value.strip())
 
 
 class JobCreate(BaseModel):
@@ -9,7 +34,13 @@ class JobCreate(BaseModel):
     selected_columns: dict[str, list[str]] = Field(default_factory=dict)
     join_config: dict[str, Any] | None = None
     destination: dict[str, Any] = Field(default_factory=lambda: {"type": "local"})
+    environment: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def normalize_environment(cls, value):
+        return normalize_platform(value)
 
 
 class JobUpdate(BaseModel):
@@ -19,7 +50,13 @@ class JobUpdate(BaseModel):
     selected_columns: dict[str, list[str]] | None = None
     join_config: dict[str, Any] | None = None
     destination: dict[str, Any] | None = None
+    environment: str | None = None
     settings: dict[str, Any] | None = None
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def normalize_environment(cls, value):
+        return normalize_platform(value)
 
 
 class RuleCreate(BaseModel):

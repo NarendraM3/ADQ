@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import logging
 from types import SimpleNamespace
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from app.config import settings
 from app.connectors.storage import LocalStorage
 from app.connectors.destinations import write_destination
@@ -34,8 +34,25 @@ def parse_data(filename: str, content: bytes):
             raise ValueError("Excel support requires openpyxl") from e
         sheet = workbook.active
         rows = sheet.iter_rows(values_only=True)
-        headers = [str(value).strip() if value is not None else f"column_{index + 1}" for index, value in enumerate(next(rows, []))]
-        return [{headers[index]: value for index, value in enumerate(row) if index < len(headers)} for row in rows if any(value is not None for value in row)]
+        raw_headers = list(next(rows, []))
+        data_rows = list(rows)
+        headers = []
+        keep = []
+        for index, value in enumerate(raw_headers):
+            # Empty Excel columns are common in exported workbooks. Do not
+            # create synthetic fields for them unless the column has data.
+            populated = any(index < len(row) and row[index] is not None for row in data_rows)
+            if value is None or not str(value).strip():
+                if not populated:
+                    continue
+                header = f"column_{index + 1}"
+            else:
+                header = str(value).strip()
+            headers.append(header)
+            keep.append(index)
+        workbook.close()
+        return [{headers[out_index]: row[index] for out_index, index in enumerate(keep) if index < len(row)}
+                for row in data_rows if any(index < len(row) and row[index] is not None for index in keep)]
     if suffix == ".parquet":
         try:
             import pyarrow.parquet as parquet
@@ -54,6 +71,54 @@ def encode_csv(records: list[dict]) -> bytes:
     return out.getvalue().encode("utf-8")
 
 
+def schema_from_records(records: list[dict]) -> dict:
+    """Build schema metadata from the rows actually read for this execution."""
+    columns = list(dict.fromkeys(key for row in records for key in row))
+    metadata = {}
+    for column in columns:
+        values = [row.get(column) for row in records]
+        present = [str(value).strip() for value in values if not is_missing(value)]
+        if present and all(_is_integer(value) for value in present):
+            kind = "integer"
+        elif present and all(_is_number(value) for value in present):
+            kind = "number"
+        elif present and all("@" in value for value in present):
+            kind = "email-like"
+        else:
+            kind = "string"
+        metadata[column] = {"inferred_type": kind,
+                            "nullable": any(is_missing(value) for value in values)}
+    return {"columns": metadata, "row_count": len(records)}
+
+
+def _is_integer(value):
+    try:
+        int(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_number(value):
+    try:
+        float(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def validate_rule_bindings(rules, job_dataset_ids, records_by_dataset, combined_records):
+    """Reject stale dataset bindings and columns absent from actual input rows."""
+    from app.rules import resolve_column
+    allowed = set(job_dataset_ids or [])
+    for rule in rules:
+        if rule.dataset_id is not None and rule.dataset_id not in allowed:
+            raise ValueError(f"Rule {rule.id} references dataset {rule.dataset_id}, which is not selected by this job")
+        rows = records_by_dataset.get(rule.dataset_id, []) if rule.dataset_id is not None else combined_records
+        if rows:
+            resolve_column(rows[0], rule.column_name)
+
+
 def execute(execution_id: int):
     db = SessionLocal()
     try:
@@ -68,6 +133,11 @@ def execute(execution_id: int):
         if len(datasets) > 2 and (job.settings or {}).get("combine_mode") != "union": raise ValueError("A join can combine up to two datasets")
         local = LocalStorage()
         record_sets = [parse_data(d.filename, local.read(d.path)) for d in datasets]
+        # Refresh persisted schema metadata from the selected source bytes so a
+        # previous import's stale/synthetic columns do not survive execution.
+        for dataset, rows in zip(datasets, record_sets):
+            if rows:
+                dataset.schema_json = schema_from_records(rows)
         if len(record_sets) == 1:
             records = record_sets[0]
         elif (job.settings or {}).get("combine_mode") == "union":
@@ -104,11 +174,19 @@ def execute(execution_id: int):
         if execution.rule_snapshot is not None:
             rules = [SimpleNamespace(**item) for item in execution.rule_snapshot]
         else:  # Backwards compatibility for executions queued before migration.
-            rules = list(db.scalars(select(Rule).where(Rule.job_id == job.id)))
+            scope = [Rule.dataset_id.is_(None)]
+            if job.dataset_ids:
+                scope.append(Rule.dataset_id.in_(job.dataset_ids))
+            rules = list(db.scalars(select(Rule).where(Rule.job_id == job.id, or_(*scope))))
+        # A rule is valid only for the dataset it names and the actual input
+        # columns selected for this job. Never interpret an absent field as
+        # null values on every row.
         # One check may have been suggested more than once with different
         # explanatory metadata. Count and execute only distinct enabled,
         # approved rules; pending and disabled checks must never validate data.
         active_rules = [r for r in rules if r.enabled and r.approved]
+        validate_rule_bindings(active_rules, job.dataset_ids,
+                               {dataset.id: rows for dataset, rows in zip(datasets, record_sets)}, records)
         signatures = {rule_signature(r) for r in active_rules}
         executed_count = len(signatures)
         pending_count = sum(not bool(r.approved) for r in rules)
@@ -134,7 +212,7 @@ def execute(execution_id: int):
             "passed_path": passed_path, "failed_path": failed_path,
             "destination": destination.get("type", "local"), "generated_at": datetime.now(timezone.utc).isoformat()}
         if not validation_complete:
-            report["message"] = "Validation incomplete: no approved rules were executed. Records were not validated."
+            report["message"] = "Validation incomplete: approve and enable at least one applicable rule, then run validation again. Records were not validated."
             report_path = dest.save(base + "/report.json", json.dumps(report, indent=2).encode())
             execution.status = "incomplete"
             execution.passed_count = execution.failed_count = 0
@@ -177,7 +255,10 @@ def execute(execution_id: int):
         db.rollback()
         execution = db.get(Execution, execution_id)
         if execution:
-            execution.status = "failed"; execution.error = f"Execution failed ({type(exc).__name__}). Verify the job configuration and connected provider."; execution.finished_at = datetime.now(timezone.utc)
+            execution.status = "failed"
+            execution.error = (f"Configuration error: {exc}" if isinstance(exc, ValueError)
+                               else f"Execution failed ({type(exc).__name__}). Verify the job configuration and connected provider.")
+            execution.finished_at = datetime.now(timezone.utc)
             execution.logs = (execution.logs or []) + [f"Execution failed with {type(exc).__name__}; see backend logs for the diagnostic."]
             db.commit()
     finally:

@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 from app.main import app
 from app.config import settings
 from app.database import Base, get_db
+from app.models import Dataset, Job, Rule
 import app.processing as processing
 
 
@@ -15,6 +16,130 @@ def test_capabilities_and_health():
     assert client.get("/health").json()["local_workflow"] == "ready"
     body = client.get("/api/v1/capabilities").json()
     assert body["destinations"]["local"] == "ready"
+
+
+def test_rule_snapshot_is_scoped_to_job_and_selected_datasets():
+    from app.main import rule_snapshot
+
+    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(test_engine)
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    try:
+        with TestingSession() as db:
+            selected = Dataset(name="selected", filename="selected.csv", path="selected.csv", schema_json={"columns": {"value": {}}})
+            unrelated = Dataset(name="unrelated", filename="unrelated.csv", path="unrelated.csv", schema_json={"columns": {"value": {}}})
+            db.add_all([selected, unrelated]); db.flush()
+            job = Job(name="scoped job", dataset_ids=[selected.id], selected_columns={str(selected.id): ["value"]}, destination={"type": "local"})
+            other_job = Job(name="other job", dataset_ids=[selected.id], selected_columns={}, destination={"type": "local"})
+            db.add_all([job, other_job]); db.flush()
+            expected = Rule(job_id=job.id, dataset_id=selected.id, column_name="value", rule_type="NOT_NULL", parameters={}, enabled=True, approved=True)
+            wrong_dataset = Rule(job_id=job.id, dataset_id=unrelated.id, column_name="value", rule_type="NOT_NULL", parameters={}, enabled=True, approved=True)
+            wrong_job = Rule(job_id=other_job.id, dataset_id=selected.id, column_name="value", rule_type="NOT_NULL", parameters={}, enabled=True, approved=True)
+            db.add_all([expected, wrong_dataset, wrong_job]); db.commit()
+
+            snapshot = rule_snapshot(db, job.id)
+            assert [item["id"] for item in snapshot] == [expected.id]
+            assert snapshot[0]["job_id"] == job.id and snapshot[0]["dataset_id"] == selected.id
+    finally:
+        Base.metadata.drop_all(test_engine)
+        test_engine.dispose()
+
+
+def test_job_environment_persists_on_create_edit_list_and_execution(monkeypatch):
+    from pathlib import Path
+    test_data = Path(".test-data").resolve()
+    test_data.mkdir(exist_ok=True)
+    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr(processing, "SessionLocal", TestingSession)
+    Base.metadata.create_all(test_engine)
+    monkeypatch.setattr(settings, "local_data_dir", str(test_data / "data"))
+
+    def override_db():
+        db = TestingSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        uploaded = client.post("/api/v1/datasets/upload", files={"file": ("platforms.csv", b"value\n1\n", "text/csv")})
+        assert uploaded.status_code == 201, uploaded.text
+        dataset_id = uploaded.json()["id"]
+        expected = ["Databricks", "Snowflake", "Microsoft Fabric"]
+        jobs = []
+        for environment in expected:
+            created = client.post("/api/v1/jobs", json={
+                "name": f"{environment} job", "dataset_ids": [dataset_id],
+                "environment": environment, "destination": {"type": "local"},
+            })
+            assert created.status_code == 201, created.text
+            job = created.json()
+            jobs.append(job["id"])
+            assert job["environment"] == environment
+            assert client.get(f"/api/v1/jobs/{job['id']}").json()["environment"] == environment
+            with TestingSession() as db:
+                assert db.get(Job, job["id"]).environment == environment
+
+            configured = client.post("/api/v1/jobs/configuration", json={"job": {
+                "name": f"configured {environment}", "dataset_ids": [dataset_id],
+                "environment": environment, "destination": {"type": "local"},
+            }, "rules": []})
+            assert configured.status_code == 201, configured.text
+            assert configured.json()["environment"] == environment
+            assert client.get(f"/api/v1/jobs/{configured.json()['id']}").json()["environment"] == environment
+
+        listed = {job["id"]: job for job in client.get("/api/v1/jobs").json()}
+        for environment, job_id in zip(expected, jobs):
+            assert listed[job_id]["environment"] == environment
+            edited = client.patch(f"/api/v1/jobs/{job_id}", json={"name": f"edited {environment}"})
+            assert edited.status_code == 200
+            assert edited.json()["environment"] == environment
+            execution = client.post(f"/api/v1/jobs/{job_id}/execute")
+            assert execution.status_code == 202
+            assert execution.json()["job_id"] == job_id
+            assert client.get(f"/api/v1/executions/{execution.json()['id']}").json()["job_id"] == job_id
+            assert client.get(f"/api/v1/jobs/{job_id}").json()["environment"] == environment
+
+        # Replacing one complete configuration must leave sibling environments intact.
+        replacement = client.put(f"/api/v1/jobs/{jobs[0]}/configuration", json={"job": {
+            "name": "edited Databricks", "dataset_ids": [dataset_id], "environment": "Databricks",
+            "destination": {"type": "local"},
+        }, "rules": []})
+        assert replacement.status_code == 200
+        assert replacement.json()["environment"] == "Databricks"
+        after_replacement = {job["id"]: job["environment"] for job in client.get("/api/v1/jobs").json()}
+        assert [after_replacement[job_id] for job_id in jobs] == expected
+
+        alias = client.post("/api/v1/jobs", json={
+            "name": "normalized platform", "dataset_ids": [dataset_id],
+            "environment": "dAtAbRiCkS", "destination": {"type": "local"},
+        })
+        assert alias.status_code == 201
+        assert alias.json()["environment"] == "Databricks"
+
+        # Source/destination providers do not determine the platform the user selected.
+        destination_only = client.post("/api/v1/jobs", json={
+            "name": "destination only", "dataset_ids": [dataset_id], "destination": {"type": "s3"},
+        })
+        assert destination_only.status_code == 201
+        assert destination_only.json()["environment"] is None
+
+        # Recover a legacy value only when its saved metadata identifies a platform.
+        with TestingSession() as db:
+            legacy = Job(name="legacy fabric", dataset_ids=[dataset_id], selected_columns={},
+                         destination={"type": "local"}, environment=None,
+                         settings={"platform": "fabric"})
+            unknown = Job(name="legacy unknown", dataset_ids=[dataset_id], selected_columns={},
+                          destination={"type": "local"}, environment=None, settings={})
+            db.add_all([legacy, unknown]); db.commit(); db.refresh(legacy); db.refresh(unknown)
+            legacy_id, unknown_id = legacy.id, unknown.id
+        assert client.get(f"/api/v1/jobs/{legacy_id}").json()["environment"] == "Microsoft Fabric"
+        assert client.get(f"/api/v1/jobs/{unknown_id}").json()["environment"] is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
 def test_local_file_job_execution(monkeypatch):
@@ -202,7 +327,7 @@ def test_zero_approved_rules_are_incomplete_not_passed(monkeypatch):
         execution = client.get(f"/api/v1/executions/{started.json()['id']}").json()
         assert execution["status"] == "incomplete"
         assert execution["passed_count"] == execution["failed_count"] == 0
-        assert any("Validation incomplete: no approved rules were executed" in line for line in execution["logs"])
+        assert any("Validation incomplete: approve and enable at least one applicable rule" in line for line in execution["logs"])
         report = client.get(f"/api/v1/executions/{execution['id']}/artifacts/report.json").json()
         assert report["validation_complete"] is False
         assert report["rules"] == {"executed": 0, "pending": 1, "disabled": 0, "skipped": 1}
@@ -348,6 +473,15 @@ def test_generated_rules_are_approved_and_scoped_to_each_new_job(monkeypatch):
             disabled = client.post(f"/api/v1/jobs/{job_id}/rules", json={"dataset_id": dataset_id, "column_name": "email",
                 "rule_type": "NOT_NULL", "enabled": False, "approved": False})
             assert disabled.status_code == 201 and disabled.json()["enabled"] is False
+            approved_disabled = client.patch(f"/api/v1/rules/{disabled.json()['id']}", json={"approved": True})
+            assert approved_disabled.status_code == 200
+            assert approved_disabled.json()["approved"] is True
+            assert approved_disabled.json()["enabled"] is False
+            persisted_disabled = client.get(f"/api/v1/jobs/{job_id}/rules").json()
+            assert next(rule for rule in persisted_disabled if rule["id"] == disabled.json()["id"])["enabled"] is False
+            enabled = client.patch(f"/api/v1/rules/{disabled.json()['id']}", json={"enabled": True})
+            assert enabled.status_code == 200
+            assert enabled.json()["enabled"] is True and enabled.json()["approved"] is True
             approval = client.patch(f"/api/v1/rules/{generated['id']}", json={"approved": True})
             assert approval.status_code == 200 and approval.json()["approved"] is True
             started = client.post(f"/api/v1/jobs/{job_id}/execute")
@@ -355,7 +489,7 @@ def test_generated_rules_are_approved_and_scoped_to_each_new_job(monkeypatch):
             assert execution["status"] == "succeeded"
             assert execution["passed_count"] == 1 and execution["failed_count"] == 1
             report = client.get(f"/api/v1/executions/{execution['id']}/artifacts/report.json").json()
-            assert report["rules"] == {"executed": 1, "pending": 2, "disabled": 1, "skipped": 2}
+            assert report["rules"] == {"executed": 2, "pending": 1, "disabled": 0, "skipped": 1}
             assert report["total"] == report["records_evaluated"] == 2
             assert report["passed_path"] and report["failed_path"]
 

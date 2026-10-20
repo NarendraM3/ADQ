@@ -36,6 +36,19 @@ def rule_signature(rule):
             json.dumps(params, sort_keys=True, separators=(",", ":"), default=str))
 
 
+def resolve_column(record: dict, requested: str) -> str:
+    """Resolve a rule column by exact spelling, then case/outer-space only."""
+    if requested in record:
+        return requested
+    key = requested.strip().casefold()
+    matches = [name for name in record if isinstance(name, str) and name.strip().casefold() == key]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous column {requested!r}: multiple source columns normalize to the same name")
+    if not matches:
+        raise ValueError(f"Rule column {requested!r} does not exist in the executed dataset")
+    return matches[0]
+
+
 def validate_rule_definition(kind: str, params: dict):
     if kind not in RULE_TYPES: raise ValueError("Unsupported rule type")
     if kind == "DATA_TYPE" and str(params.get("type", "string")).lower() not in {"string", "str", "int", "integer", "float", "number", "decimal", "bool", "boolean", "date", "datetime"}:
@@ -80,9 +93,13 @@ def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
         if signature in executed:
             continue
         executed.add(signature)
+        # Resolve once against the actual execution records. Missing or ambiguous
+        # columns are configuration errors, never row-level null values.
+        resolved = resolve_column(records[0], col) if records else None
         seen = set()
         for idx, row in enumerate(records):
-            value = row.get(col)
+            actual_col = resolved if resolved in row else resolve_column(row, col)
+            value = row.get(actual_col)
             if is_missing(value):
                 if kind in {"NOT_NULL", "EMAIL_FORMAT"}:
                     reason = f"Missing required {col}: the {col} field is empty."

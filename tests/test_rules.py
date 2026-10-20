@@ -197,3 +197,26 @@ def test_pending_and_disabled_rules_are_never_executed():
     passed, failed = validate_records(records, rules)
     assert passed == records
     assert failed == []
+
+
+def test_email_rule_resolves_case_and_outer_whitespace_but_keeps_source_key():
+    records = [{" Email ": "aarav.sharma@example.com"}, {" Email ": "bad-address"}, {" Email ": None}]
+    passed, failed = validate_records(records, [make_rule("EMAIL_FORMAT", "email")])
+    assert passed == records[:1]
+    assert [item["row_index"] for item in failed] == [1, 2]
+    assert "Invalid email format" in failed[0]["failure_reasons"][0]
+    assert "Missing required email" in failed[1]["failure_reasons"][0]
+
+
+def test_missing_rule_column_is_a_configuration_error_not_row_failures():
+    import pytest
+    with pytest.raises(ValueError, match="does not exist in the executed dataset"):
+        validate_records([{"EmployeeID": "EMP001", "Email": "person@example.com"}],
+                         [make_rule("NOT_NULL", "emp_id")])
+
+
+def test_normalized_column_collision_is_rejected_as_ambiguous():
+    import pytest
+    with pytest.raises(ValueError, match="Ambiguous column"):
+        validate_records([{"Email": "a@example.com", " email ": "b@example.com"}],
+                         [make_rule("EMAIL_FORMAT", "email")])

@@ -2,16 +2,18 @@ import json, logging, mimetypes, re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from io import BytesIO
+import csv
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import Base, engine, get_db
 from app.models import Correction, Credential, Dataset, Execution, Job, Rule
 from app.processing import execute, parse_data
-from app.rules import RULE_TYPES, validate_rule_definition
-from app.schemas import CorrectionCreate, CredentialCreate, JobConfiguration, JobCreate, JobUpdate, RuleCreate, RuleUpdate
+from app.rules import RULE_TYPES, rule_signature, validate_rule_definition
+from app.schemas import CorrectionCreate, CredentialCreate, JobConfiguration, JobCreate, JobUpdate, RuleCreate, RuleUpdate, normalize_platform
 from app.connectors.storage import LocalStorage, get_storage, get_source_adapter
 
 logging.basicConfig(level=settings.log_level)
@@ -24,6 +26,10 @@ async def lifespan(app):
         if "settings" not in {column["name"] for column in inspect(engine).get_columns("jobs")}:
             with engine.begin() as connection:
                 connection.exec_driver_sql("ALTER TABLE jobs ADD COLUMN settings JSON NOT NULL DEFAULT '{}'")
+        if "environment" not in {column["name"] for column in inspect(engine).get_columns("jobs")}:
+            with engine.begin() as connection:
+                # Existing jobs have no reliable record of the platform selected at creation.
+                connection.exec_driver_sql("ALTER TABLE jobs ADD COLUMN environment VARCHAR(100)")
         if "rule_snapshot" not in {column["name"] for column in inspect(engine).get_columns("executions")}:
             with engine.begin() as connection:
                 connection.exec_driver_sql("ALTER TABLE executions ADD COLUMN rule_snapshot JSON")
@@ -36,6 +42,34 @@ app = FastAPI(title="ADQ Automation API", version="0.1.0", description="AI-assis
 def not_found(obj, name):
     if obj is None: raise HTTPException(404, f"{name} not found")
     return obj
+
+
+def job_environment(job: Job) -> str | None:
+    """Return this job's saved platform, with explicit legacy metadata as fallback."""
+    settings = job.settings if isinstance(job.settings, dict) else {}
+    destination = job.destination if isinstance(job.destination, dict) else {}
+    return normalize_platform(
+        job.environment
+        or settings.get("environment")
+        or settings.get("platform")
+        or destination.get("platform")
+    )
+
+
+def infer_job_environment(environment: str | None, settings: dict | None = None) -> str | None:
+    settings = settings if isinstance(settings, dict) else {}
+    # The selected platform is independent of the job's source and output destination.
+    return normalize_platform(environment or settings.get("environment") or settings.get("platform"))
+
+
+def job_response(job: Job) -> dict:
+    return {
+        "id": job.id, "name": job.name, "description": job.description,
+        "dataset_ids": job.dataset_ids, "selected_columns": job.selected_columns,
+        "join_config": job.join_config, "destination": job.destination,
+        "environment": job_environment(job), "settings": job.settings,
+        "created_at": job.created_at, "updated_at": job.updated_at,
+    }
 
 
 def credential_key():
@@ -117,7 +151,7 @@ def dataset_detail(dataset_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/v1/jobs")
 def list_jobs(db: Session = Depends(get_db)):
-    return db.scalars(select(Job).order_by(Job.id.desc())).all()
+    return [job_response(job) for job in db.scalars(select(Job).order_by(Job.id.desc()))]
 
 
 @app.post("/api/v1/jobs", status_code=201)
@@ -125,12 +159,14 @@ def create_job(body: JobCreate, db: Session = Depends(get_db)):
     datasets=[db.get(Dataset,did) for did in body.dataset_ids]
     if any(d is None for d in datasets): raise HTTPException(422, "Every dataset_ids entry must exist")
     validate_job_inputs(body,datasets)
-    job = Job(**body.model_dump()); db.add(job); db.commit(); db.refresh(job); return job
+    values = body.model_dump()
+    values["environment"] = infer_job_environment(values.get("environment"), body.settings)
+    job = Job(**values); db.add(job); db.commit(); db.refresh(job); return job_response(job)
 
 
 @app.get("/api/v1/jobs/{job_id}")
 def get_job(job_id: int, db: Session = Depends(get_db)):
-    return not_found(db.get(Job, job_id), "Job")
+    return job_response(not_found(db.get(Job, job_id), "Job"))
 
 
 @app.patch("/api/v1/jobs/{job_id}")
@@ -142,10 +178,10 @@ def update_job(job_id: int, body: JobUpdate, db: Session = Depends(get_db)):
     if any(d is None for d in datasets): raise HTTPException(422, "Every dataset_ids entry must exist")
     merged={"name":changes.get("name",job.name),"description":changes.get("description",job.description),"dataset_ids":dataset_ids,
         "selected_columns":changes.get("selected_columns",job.selected_columns),"join_config":changes.get("join_config",job.join_config),
-        "destination":changes.get("destination",job.destination),"settings":changes.get("settings",job.settings or {})}
+        "destination":changes.get("destination",job.destination),"environment":changes.get("environment",job_environment(job)),"settings":changes.get("settings",job.settings or {})}
     validate_job_inputs(JobCreate(**merged),datasets)
     for k,v in changes.items(): setattr(job, k, v)
-    db.commit(); db.refresh(job); return job
+    db.commit(); db.refresh(job); return job_response(job)
 
 
 def validate_configuration_rules(body: JobCreate, rules: list[RuleCreate], db: Session):
@@ -170,7 +206,9 @@ def create_job_configuration(body: JobConfiguration, db: Session = Depends(get_d
         raise HTTPException(422, "Every dataset_ids entry must exist")
     validate_job_inputs(body.job, datasets)
     validate_configuration_rules(body.job, body.rules, db)
-    job = Job(**body.job.model_dump())
+    values = body.job.model_dump()
+    values["environment"] = infer_job_environment(values.get("environment"), body.job.settings)
+    job = Job(**values)
     db.add(job)
     db.flush()
     for rule in body.rules:
@@ -181,7 +219,7 @@ def create_job_configuration(body: JobConfiguration, db: Session = Depends(get_d
         db.add(Rule(job_id=job.id, **values))
     db.commit()
     db.refresh(job)
-    return job
+    return job_response(job)
 
 
 @app.put("/api/v1/jobs/{job_id}/configuration")
@@ -192,7 +230,9 @@ def replace_job_configuration(job_id: int, body: JobConfiguration, db: Session =
         raise HTTPException(422, "Every dataset_ids entry must exist")
     validate_job_inputs(body.job, datasets)
     validate_configuration_rules(body.job, body.rules, db)
-    for key, value in body.job.model_dump().items():
+    values = body.job.model_dump()
+    values["environment"] = infer_job_environment(values.get("environment") or job_environment(job), body.job.settings)
+    for key, value in values.items():
         setattr(job, key, value)
     db.execute(delete(Rule).where(Rule.job_id == job_id))
     for rule in body.rules:
@@ -203,7 +243,7 @@ def replace_job_configuration(job_id: int, body: JobConfiguration, db: Session =
         db.add(Rule(job_id=job_id, **values))
     db.commit()
     db.refresh(job)
-    return job
+    return job_response(job)
 
 
 @app.delete("/api/v1/jobs/{job_id}", status_code=204)
@@ -251,6 +291,114 @@ def landing_zone(job_id: int, db: Session = Depends(get_db)):
 def list_rules(job_id: int, db: Session = Depends(get_db)):
     not_found(db.get(Job, job_id), "Job")
     return db.scalars(select(Rule).where(Rule.job_id == job_id).order_by(Rule.id)).all()
+
+
+RULE_IMPORT_COLUMNS = ["dataset_id", "column_name", "rule_type", "parameters", "severity", "enabled", "approved"]
+
+
+def _rules_workbook():
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.worksheet.datavalidation import DataValidation
+    wb = Workbook(); ws = wb.active; ws.title = "Rules"
+    ws.append(RULE_IMPORT_COLUMNS)
+    ws.append(["", "email", "EMAIL_FORMAT", "{}", "high", True, False])
+    ws.append(["", "age", "RANGE", '{"min":0,"max":120}', "medium", True, False])
+    ws.freeze_panes = "A2"; ws.auto_filter.ref = "A1:G3"
+    widths = [16, 26, 20, 38, 14, 12, 12]
+    for i, width in enumerate(widths, 1): ws.column_dimensions[chr(64+i)].width = width
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="173B52"); cell.alignment = Alignment(vertical="center")
+    dv = DataValidation(type="list", formula1='"' + ",".join(sorted(RULE_TYPES)) + '"'); ws.add_data_validation(dv); dv.add("C2:C1000")
+    sev = DataValidation(type="list", formula1='"low,medium,high,critical"'); ws.add_data_validation(sev); sev.add("E2:E1000")
+    flags = DataValidation(type="list", formula1='"TRUE,FALSE"'); ws.add_data_validation(flags); flags.add("F2:G1000")
+    info=wb.create_sheet("Instructions")
+    for row in [["AI Data Quality Rules — Import Guide"], ["Required columns: column_name, rule_type"], ["Optional columns: dataset_id (blank applies to all selected data), parameters (JSON object), severity, enabled, approved"], ["Use dataset_id from your selected datasets. Leave blank to make the rule job-wide."], ["Rule types: "+", ".join(sorted(RULE_TYPES))], ["Examples: RANGE parameters {\"min\":0,\"max\":100}; REGEX {\"pattern\":\"^[A-Z]+$\"}; IN_SET {\"values\":[\"A\",\"B\"]}"], ["Imported rules are validated and shown for review before they are saved."]]: info.append(row)
+    info.column_dimensions["A"].width=115
+    for c in info[1]: c.font=Font(bold=True,size=14,color="173B52")
+    output=BytesIO(); wb.save(output); output.seek(0); return output
+
+
+@app.get("/api/v1/rules/template")
+def download_rules_template():
+    return StreamingResponse(_rules_workbook(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition":"attachment; filename=data-quality-rules-template.xlsx"})
+
+
+@app.post("/api/v1/jobs/{job_id}/rules/import-preview")
+async def preview_rule_import(job_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    job = not_found(db.get(Job, job_id), "Job")
+    name=(file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xls")): raise HTTPException(415, "Upload an .xlsx or .xls workbook")
+    raw=await file.read()
+    try:
+        if name.endswith(".xlsx"):
+            from openpyxl import load_workbook
+            sheet=load_workbook(BytesIO(raw), read_only=True, data_only=True).active
+            matrix=list(sheet.iter_rows(values_only=True))
+        else:
+            import xlrd
+            book=xlrd.open_workbook(file_contents=raw); sheet=book.sheet_by_index(0)
+            matrix=[[sheet.cell_value(r,c) for c in range(sheet.ncols)] for r in range(sheet.nrows)]
+    except Exception as e: raise HTTPException(422, "Could not read the workbook. Check that it is a valid Excel file.") from e
+    if not matrix: raise HTTPException(422, "The Rules sheet is empty")
+    headers=[str(v or "").strip().lower() for v in matrix[0]]
+    if "column_name" not in headers or "rule_type" not in headers: raise HTTPException(422, "Required columns column_name and rule_type are missing")
+    existing=list(db.scalars(select(Rule).where(Rule.job_id==job_id)))
+    known={rule_signature(r) for r in existing}; seen=set(); valid=[]; errors=[]
+    datasets={d.id:d for d in db.scalars(select(Dataset).where(Dataset.id.in_(job.dataset_ids))).all()}
+    for line, values in enumerate(matrix[1:], 2):
+        row={headers[i]: values[i] if i<len(values) else None for i in range(len(headers))}
+        if not any(v is not None and str(v).strip() for v in row.values()): continue
+        try:
+            column=str(row.get("column_name") or "").strip(); kind=str(row.get("rule_type") or "").strip().upper()
+            if not column: raise ValueError("column_name is required")
+            if not kind: raise ValueError("rule_type is required")
+            dsval=row.get("dataset_id"); dsid=int(dsval) if dsval is not None and str(dsval).strip() else None
+            if dsid is not None and dsid not in datasets: raise ValueError("dataset_id must belong to this job")
+            if dsid is not None and column not in (datasets[dsid].schema_json or {}).get("columns",{}): raise ValueError("column_name is not present in the selected dataset")
+            if dsid is None and not any(column in (d.schema_json or {}).get("columns",{}) for d in datasets.values()): raise ValueError("column_name was not found in selected datasets")
+            params=row.get("parameters") or {}
+            if isinstance(params,str): params=json.loads(params) if params.strip() else {}
+            if not isinstance(params,dict): raise ValueError("parameters must be a JSON object")
+            validate_rule_definition(kind,params)
+            severity=str(row.get("severity") or "medium").strip().lower()
+            if severity not in {"low","medium","high","critical"}: raise ValueError("severity must be low, medium, high, or critical")
+            rule=Rule(job_id=job_id,dataset_id=dsid,column_name=column,rule_type=kind,parameters={**params,"severity":severity},enabled=str(row.get("enabled") if row.get("enabled") is not None else "false").lower() in ("true","1","yes"),approved=str(row.get("approved") if row.get("approved") is not None else "false").lower() in ("true","1","yes"))
+            sig=rule_signature(rule)
+            if sig in known or sig in seen: raise ValueError("Duplicate rule (already exists or repeated in this file)")
+            seen.add(sig); valid.append({"row_number":line,"dataset_id":dsid,"column_name":column,"rule_type":kind,"parameters":rule.parameters,"enabled":rule.enabled,"approved":rule.approved,"severity":severity})
+        except Exception as e: errors.append({"row_number":line,"error":str(e),"row":{k:(v.isoformat() if hasattr(v,"isoformat") else v) for k,v in row.items()}})
+    return {"valid":valid,"errors":errors}
+
+
+@app.post("/api/v1/jobs/{job_id}/rules/import")
+def import_rules(job_id: int, body: dict, db: Session = Depends(get_db)):
+    job=not_found(db.get(Job,job_id),"Job")
+    saved=[]
+    existing={rule_signature(r) for r in db.scalars(select(Rule).where(Rule.job_id==job_id))}
+    for item in body.get("rules",[]):
+        payload=RuleCreate(**item)
+        kind=payload.rule_type.upper(); validate_rule_definition(kind,payload.parameters)
+        if payload.dataset_id is not None:
+            if payload.dataset_id not in job.dataset_ids: raise HTTPException(422,"Rule dataset_id must be selected by the job")
+            ds=db.get(Dataset,payload.dataset_id)
+            if not ds or payload.column_name not in (ds.schema_json or {}).get("columns",{}): raise HTTPException(422,"Rule column does not exist in the selected dataset")
+        rule=Rule(job_id=job_id,**{**payload.model_dump(),"rule_type":kind})
+        signature=rule_signature(rule)
+        if signature in existing: raise HTTPException(409,"An imported rule is now a duplicate; preview the workbook again")
+        existing.add(signature); db.add(rule); saved.append(rule)
+    db.commit()
+    for rule in saved: db.refresh(rule)
+    return {"added":len(saved),"rules":saved}
+
+
+@app.post("/api/v1/rules/error-report")
+def download_rule_errors(body: dict):
+    from openpyxl import Workbook
+    wb=Workbook(); ws=wb.active; ws.title="Invalid rows"; ws.append(["Excel row","Error","Original row"])
+    for item in body.get("errors",[]): ws.append([item.get("row_number"),item.get("error"),json.dumps(item.get("row",{}),default=str)])
+    output=BytesIO(); wb.save(output); output.seek(0)
+    return StreamingResponse(output,media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",headers={"Content-Disposition":"attachment; filename=data-quality-rule-errors.xlsx"})
 
 
 @app.post("/api/v1/jobs/{job_id}/baseline-rules", status_code=201)
@@ -549,7 +697,11 @@ def job_executions(job_id: int, db: Session = Depends(get_db)):
 
 def rule_snapshot(db: Session, job_id: int):
     """Capture every rule and its lifecycle state when a run is requested."""
-    rules = db.scalars(select(Rule).where(Rule.job_id == job_id).order_by(Rule.id)).all()
+    job = not_found(db.get(Job, job_id), "Job")
+    scope = [Rule.dataset_id.is_(None)]
+    if job.dataset_ids:
+        scope.append(Rule.dataset_id.in_(job.dataset_ids))
+    rules = db.scalars(select(Rule).where(Rule.job_id == job_id, or_(*scope)).order_by(Rule.id)).all()
     return [{"id": r.id, "job_id": r.job_id, "dataset_id": r.dataset_id,
              "column_name": r.column_name, "rule_type": r.rule_type,
              "parameters": r.parameters or {}, "enabled": bool(r.enabled),
@@ -612,7 +764,10 @@ def revalidate(execution_id: int, db: Session = Depends(get_db)):
         from types import SimpleNamespace
         rules=[SimpleNamespace(**item) for item in e.rule_snapshot]
     else:
-        rules=list(db.scalars(select(Rule).where(Rule.job_id==job.id)))
+        scope = [Rule.dataset_id.is_(None)]
+        if job.dataset_ids:
+            scope.append(Rule.dataset_id.in_(job.dataset_ids))
+        rules=list(db.scalars(select(Rule).where(Rule.job_id==job.id, or_(*scope))))
     from app.rules import validate_records
     passed,failed=validate_records(records,rules)
     root=Path(settings.local_data_dir).resolve(); base=Path(e.report_path).parent
@@ -682,6 +837,13 @@ def connect_source(body: CredentialCreate, prefix: str = "", db: Session = Depen
     if sensitive:
         raise HTTPException(422, f"Sensitive values belong in secrets, not config: {sensitive}")
     cipher = credential_key()
+    for existing in db.scalars(select(Credential).where(Credential.provider == body.provider, Credential.name == body.name)).all():
+        try:
+            existing_secrets = json.loads(cipher.decrypt(existing.secret_ciphertext.encode()))
+        except (InvalidToken, ValueError):
+            continue
+        if existing.config == body.config and existing_secrets == body.secrets:
+            return {"id": existing.id, "name": existing.name, "provider": existing.provider, "files": files}
     item = Credential(name=body.name, provider=body.provider, secret_ciphertext=cipher.encrypt(json.dumps(body.secrets).encode()).decode(), config=body.config)
     db.add(item); db.commit(); db.refresh(item)
     return {"id": item.id, "name": item.name, "provider": item.provider, "files": files}
@@ -695,6 +857,10 @@ def list_credentials(db: Session = Depends(get_db)):
 @app.post("/api/v1/datasets/import/{credential_id}", status_code=201)
 def import_cloud_dataset(credential_id: int, object_key: str, name: str | None = None, db: Session = Depends(get_db)):
     item=not_found(db.get(Credential,credential_id),"Credential")
+    for existing in db.scalars(select(Dataset).where(Dataset.source_type == item.provider)).all():
+        source_meta = (existing.schema_json or {}).get("_source", {})
+        if source_meta.get("credential_id") == credential_id and source_meta.get("object_key") == object_key:
+            return existing
     try: secrets=json.loads(credential_key().decrypt(item.secret_ciphertext.encode()))
     except (InvalidToken, ValueError) as e: raise HTTPException(500,"Stored credential cannot be decrypted") from e
     provider=item.provider
@@ -711,7 +877,7 @@ def import_cloud_dataset(credential_id: int, object_key: str, name: str | None =
         records=parse_data(fname if storage_provider in ("databricks","snowflake") else object_key,content)
     except Exception as e: raise HTTPException(502,"Source read failed; verify the connection and selected object") from e
     columns=list(dict.fromkeys(k for r in records[:1000] for k in r))
-    schema={"columns":{c:{"inferred_type":infer_type([r.get(c) for r in records[:1000]]),"nullable":any(r.get(c) in (None,"") for r in records[:1000])} for c in columns},"row_count":len(records)}
+    schema={"columns":{c:{"inferred_type":infer_type([r.get(c) for r in records[:1000]]),"nullable":any(r.get(c) in (None,"") for r in records[:1000])} for c in columns},"row_count":len(records),"_source":{"credential_id":credential_id,"object_key":object_key}}
     path=LocalStorage().save(f"uploads/{__import__('uuid').uuid4().hex}-{fname}",content)
     ds=Dataset(name=name or Path(fname).stem,filename=fname,path=path,source_type=provider,schema_json=schema)
     db.add(ds);db.commit();db.refresh(ds);return ds

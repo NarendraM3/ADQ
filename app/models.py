@@ -28,6 +28,7 @@ class Job(Base):
     selected_columns: Mapped[dict] = mapped_column(JSON, default=dict)
     join_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     destination: Mapped[dict] = mapped_column(JSON, default=lambda: {"type": "local"})
+    environment: Mapped[str | None] = mapped_column(String(100), nullable=True)
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
