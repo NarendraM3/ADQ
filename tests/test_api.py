@@ -8,7 +8,18 @@ from app.main import app
 from app.config import settings
 from app.database import Base, get_db
 from app.models import Dataset, Job, Rule
+from app.schemas import JobCreate
+from app.main import validate_job_inputs
 import app.processing as processing
+
+
+@pytest.fixture(autouse=True)
+def disable_environment_databricks_output(monkeypatch):
+    # These API tests intentionally exercise local output even when the developer's
+    # project .env contains live Databricks configuration.
+    monkeypatch.setattr(settings, "databricks_server_hostname", None)
+    monkeypatch.setattr(settings, "databricks_http_path", None)
+    monkeypatch.setattr(settings, "databricks_token", None)
 
 
 def test_capabilities_and_health():
@@ -16,6 +27,85 @@ def test_capabilities_and_health():
     assert client.get("/health").json()["local_workflow"] == "ready"
     body = client.get("/api/v1/capabilities").json()
     assert body["destinations"]["local"] == "ready"
+
+
+def test_job_selection_is_explicit_and_columns_keep_dataset_association():
+    first = Dataset(id=11, name="first", filename="first.csv", path="first.csv",
+                    schema_json={"columns": {"shared": {}, "first_only": {}}})
+    second = Dataset(id=12, name="second", filename="second.csv", path="second.csv",
+                     schema_json={"columns": {"shared": {}, "second_only": {}}})
+    job = JobCreate(name="selected sources", dataset_ids=[11, 12],
+                    selected_columns={"11": ["shared"], "12": ["second_only"]},
+                    settings={"combine_mode": "union"})
+    validate_job_inputs(job, [first, second])
+    assert job.selected_columns["11"] == ["shared"]
+    assert job.selected_columns["12"] == ["second_only"]
+
+    job.selected_columns = {"11": [], "12": []}
+    with pytest.raises(HTTPException, match="Select at least one column"):
+        validate_job_inputs(job, [first, second])
+
+    job.selected_columns = {"11": ["shared"], "99": ["shared"]}
+    with pytest.raises(HTTPException, match="outside the job"):
+        validate_job_inputs(job, [first, second])
+
+
+def test_landing_selection_is_scoped_to_workflow_and_survives_refresh():
+    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    Base.metadata.create_all(test_engine)
+
+    def override_db():
+        with TestingSession() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        with TestingSession() as db:
+            selected = Dataset(name="employee", filename="employee.csv", path="selected.csv", source_type="s3",
+                               schema_json={"columns": {"name": {}}, "_source": {"credential_id": 31, "object_key": "hr/employee.csv"}})
+            same_name = Dataset(name="employee", filename="employee.csv", path="other.csv", source_type="s3",
+                                schema_json={"columns": {"name": {}}, "_source": {"credential_id": 32, "object_key": "archive/employee.csv"}})
+            local_upload = Dataset(name="market_data", filename="market_data.csv", path="uploads/market_data.csv", source_type="local",
+                                   schema_json={"columns": {"price": {}}, "row_count": 8523})
+            historical = Dataset(name="run output", filename="passed.csv", path="passed.csv", source_type="derived",
+                                 schema_json={"columns": {"name": {}}, "_source": {"artifact_type": "pass_output"}})
+            db.add_all([selected, same_name, local_upload, historical]); db.commit()
+            selected_id, other_id, local_id, historical_id = selected.id, same_name.id, local_upload.id, historical.id
+        client = TestClient(app)
+        response = client.put("/api/v1/workflows/workflow-b/selection", json={
+            "dataset_ids": [selected_id], "source_connection_ids": {str(selected_id): 31}})
+        assert response.status_code == 200
+        assert response.json()["workflow_id"] == "workflow-b"
+        assert response.json()["dataset_ids"] == [selected_id]
+        assert response.json()["datasets"][0]["source_type"] == "s3"
+        # A browser refresh reads this workflow's exact backend selection.
+        refreshed = client.get("/api/v1/workflows/workflow-b/selection").json()
+        assert refreshed["dataset_ids"] == [selected_id]
+        assert [item["id"] for item in refreshed["datasets"]] == [selected_id]
+        # Workflow A's local upload remains available and does not leak into B.
+        workflow_a = client.put("/api/v1/workflows/workflow-a/selection", json={"dataset_ids": [local_id]})
+        assert workflow_a.status_code == 200
+        assert client.get("/api/v1/workflows/workflow-b/selection").json()["dataset_ids"] == [selected_id]
+        assert client.get(f"/api/v1/datasets/{local_id}").json()["filename"] == "market_data.csv"
+        # The saved union job payload only receives workflow B's selection.
+        job = client.post("/api/v1/jobs", json={
+            "name": "workflow B", "dataset_ids": refreshed["dataset_ids"],
+            "selected_columns": {str(selected_id): ["name"]}, "settings": {"combine_mode": "union"}})
+        assert job.status_code == 201, job.text
+        assert job.json()["dataset_ids"] == [selected_id]
+        # Deselecting the only file persists an empty selection; it cannot reappear.
+        empty = client.put("/api/v1/workflows/workflow-b/selection", json={"dataset_ids": []})
+        assert empty.status_code == 200
+        assert client.get("/api/v1/workflows/workflow-b/selection").json()["dataset_ids"] == []
+        assert client.get(f"/api/v1/datasets/{other_id}").json()["source_type"] == "s3"
+        assert client.put("/api/v1/workflows/workflow-b/selection", json={
+            "dataset_ids": [selected_id, other_id, historical_id],
+            "source_connection_ids": {str(selected_id): 32}}).status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        Base.metadata.drop_all(test_engine)
+        test_engine.dispose()
 
 
 def test_rule_snapshot_is_scoped_to_job_and_selected_datasets():
@@ -434,7 +524,7 @@ def test_generated_rules_are_approved_and_scoped_to_each_new_job(monkeypatch):
         finally:
             db.close()
 
-    async def suggestions(datasets, db):
+    async def suggestions(datasets, db, selected_columns=None):
         return [{"dataset_id": datasets[0].id, "column_name": "email", "rule_type": "EMAIL_FORMAT",
                  "parameters": {"strict": True}, "severity": "high", "rationale": "Check email format"}]
 

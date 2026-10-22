@@ -3,7 +3,8 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "scripts": {"dev":"vite --host 0.0.0.0", "build":"tsc -b && vite build", "test":"node src/platform.test.mjs", "preview":"vite preview"},
+  "scripts": {"dev":"vite --host 0.0.0.0", "build":"tsc -b && vite build", "test":"node src/platform.test.mjs && node src/selection.test.mjs && node src/executionPolling.test.mjs", "preview":"vite preview"},
   "dependencies": {"@vitejs/plugin-react":"latest", "vite":"latest", "typescript":"latest", "react":"latest", "react-dom":"latest", "lucide-react":"latest", "clsx":"latest"},
   "devDependencies": {"tailwindcss":"^4.1.0", "@tailwindcss/vite":"^4.1.0", "@types/react":"latest", "@types/react-dom":"latest"}
 }
+

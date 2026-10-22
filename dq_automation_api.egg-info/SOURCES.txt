@@ -16,5 +16,8 @@ dq_automation_api.egg-info/SOURCES.txt
 dq_automation_api.egg-info/dependency_links.txt
 dq_automation_api.egg-info/requires.txt
 dq_automation_api.egg-info/top_level.txt
+tests/test_ai_provider.py
 tests/test_api.py
+tests/test_destinations.py
+tests/test_processing.py
 tests/test_rules.py

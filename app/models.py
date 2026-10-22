@@ -19,6 +19,14 @@ class Dataset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class WorkflowSelection(Base):
+    __tablename__ = "workflow_selections"
+    workflow_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    dataset_ids: Mapped[list] = mapped_column(JSON, default=list)
+    source_connection_ids: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[int] = mapped_column(primary_key=True)

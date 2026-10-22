@@ -10,7 +10,7 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import Base, engine, get_db
-from app.models import Correction, Credential, Dataset, Execution, Job, Rule
+from app.models import Correction, Credential, Dataset, Execution, Job, Rule, WorkflowSelection
 from app.processing import execute, parse_data
 from app.rules import RULE_TYPES, rule_signature, validate_rule_definition
 from app.schemas import CorrectionCreate, CredentialCreate, JobConfiguration, JobCreate, JobUpdate, RuleCreate, RuleUpdate, normalize_platform
@@ -111,6 +111,56 @@ def list_datasets(db: Session = Depends(get_db)):
     return db.scalars(select(Dataset).order_by(Dataset.id.desc())).all()
 
 
+@app.get("/api/v1/workflows/{workflow_id}/selection")
+def get_workflow_selection(workflow_id: str, db: Session = Depends(get_db)):
+    selection = db.get(WorkflowSelection, workflow_id)
+    if selection is None:
+        return {"workflow_id": workflow_id, "dataset_ids": [], "source_connection_ids": {}, "datasets": []}
+    ids = selection.dataset_ids or []
+    rows = {d.id: d for d in db.scalars(select(Dataset).where(Dataset.id.in_(ids))).all()} if ids else {}
+    valid = [did for did in ids if did in rows]
+    return {"workflow_id": workflow_id, "dataset_ids": valid,
+            "source_connection_ids": selection.source_connection_ids or {},
+            "datasets": [rows[did] for did in valid]}
+
+
+@app.put("/api/v1/workflows/{workflow_id}/selection")
+def set_workflow_selection(workflow_id: str, body: dict, db: Session = Depends(get_db)):
+    """Persist exactly the explicitly selected dataset IDs for this workflow."""
+    ids = body.get("dataset_ids")
+    connections = body.get("source_connection_ids", {})
+    if not isinstance(workflow_id, str) or not workflow_id.strip() or len(workflow_id) > 36:
+        raise HTTPException(422, "A valid workflow ID is required")
+    if not isinstance(ids, list) or any(not isinstance(i, int) or i <= 0 for i in ids):
+        raise HTTPException(422, "dataset_ids must contain valid dataset IDs")
+    if len(set(ids)) != len(ids):
+        raise HTTPException(422, "dataset_ids must be unique")
+    rows = {d.id: d for d in db.scalars(select(Dataset).where(Dataset.id.in_(ids))).all()}
+    if len(rows) != len(ids):
+        raise HTTPException(404, "A selected dataset no longer exists")
+    normalized_connections = {}
+    for dataset_id in ids:
+        expected = connections.get(str(dataset_id)) if isinstance(connections, dict) else None
+        source = (rows[dataset_id].schema_json or {}).get("_source", {})
+        actual = source.get("credential_id")
+        if expected is not None and actual != expected:
+            raise HTTPException(422, "Selected dataset does not belong to the selected source connection")
+        if actual is not None:
+            normalized_connections[str(dataset_id)] = actual
+    selection = db.get(WorkflowSelection, workflow_id)
+    if selection is None:
+        selection = WorkflowSelection(workflow_id=workflow_id, dataset_ids=ids,
+                                      source_connection_ids=normalized_connections)
+        db.add(selection)
+    else:
+        selection.dataset_ids = ids
+        selection.source_connection_ids = normalized_connections
+    db.commit()
+    return {"workflow_id": workflow_id, "dataset_ids": ids,
+            "source_connection_ids": normalized_connections,
+            "datasets": [rows[dataset_id] for dataset_id in ids]}
+
+
 @app.post("/api/v1/datasets/upload", status_code=201)
 async def upload_dataset(file: UploadFile = File(...), name: str | None = None, db: Session = Depends(get_db)):
     fname = Path(file.filename or "").name
@@ -158,6 +208,8 @@ def list_jobs(db: Session = Depends(get_db)):
 def create_job(body: JobCreate, db: Session = Depends(get_db)):
     datasets=[db.get(Dataset,did) for did in body.dataset_ids]
     if any(d is None for d in datasets): raise HTTPException(422, "Every dataset_ids entry must exist")
+    if "selected_columns" in body.model_fields_set and not body.selected_columns:
+        raise HTTPException(422,"Select at least one column for the job")
     validate_job_inputs(body,datasets)
     values = body.model_dump()
     values["environment"] = infer_job_environment(values.get("environment"), body.settings)
@@ -204,6 +256,8 @@ def create_job_configuration(body: JobConfiguration, db: Session = Depends(get_d
     datasets = [db.get(Dataset, did) for did in body.job.dataset_ids]
     if any(d is None for d in datasets):
         raise HTTPException(422, "Every dataset_ids entry must exist")
+    if "selected_columns" in body.job.model_fields_set and not body.job.selected_columns:
+        raise HTTPException(422,"Select at least one column for the job")
     validate_job_inputs(body.job, datasets)
     validate_configuration_rules(body.job, body.rules, db)
     values = body.job.model_dump()
@@ -269,6 +323,8 @@ def validate_job_inputs(body,datasets):
         if str(dataset_id) not in known: raise HTTPException(422,f"selected_columns references dataset {dataset_id} outside the job")
         missing=set(columns)-known[str(dataset_id)]
         if missing: raise HTTPException(422,f"Unknown selected columns for dataset {dataset_id}: {sorted(missing)}")
+    if body.selected_columns and not any(body.selected_columns.values()):
+        raise HTTPException(422,"Select at least one column for the job")
     if len(datasets)>=2 and (body.settings or {}).get("combine_mode") != "union":
         cfg=body.join_config
         if not cfg: raise HTTPException(422,"join_config is required for a two-dataset job")

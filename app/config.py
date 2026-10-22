@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     local_data_dir: str = "./data"
     max_upload_mb: int = 200
     secret_encryption_key: str | None = None
+    databricks_server_hostname: str | None = None
+    databricks_http_path: str | None = None
+    databricks_token: str | None = None
+    databricks_catalog: str = "dq_catalog"
+    databricks_schema: str = "dq_schema"
 
     @field_validator("secret_encryption_key", mode="before")
     @classmethod

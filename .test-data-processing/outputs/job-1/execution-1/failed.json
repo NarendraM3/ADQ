@@ -1,0 +1,14 @@
+[
+  {
+    "row_index": 1,
+    "record": {
+      "id": "2",
+      "name": "Lin",
+      "right_id": "2",
+      "score": "bad"
+    },
+    "failure_reasons": [
+      "Invalid score: 'bad' cannot be parsed as integer."
+    ]
+  }
+]
