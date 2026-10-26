@@ -31,6 +31,24 @@ const noWait = async () => {};
   assert.equal(final.status, 'incomplete');
 }
 
+// A completed backend execution immediately supplies its saved counts and
+// record-level failures, then stops status polling for that execution ID.
+{
+  let statusReads = 0, rendered;
+  const backendExecution = { id: 10, status: 'succeeded', passed_count: 10, failed_count: 10 };
+  const backendFailures = [{ row_index: 3, record: { Email: 'bad' }, failure_reasons: ['Invalid email'] }];
+  pollExecution({ executionId: 10,
+    getExecution: async id => { assert.equal(id, backendExecution.id); statusReads++; return backendExecution; },
+    getFailed: async id => { assert.equal(id, backendExecution.id); return backendFailures; },
+    onUpdate: (run, details) => { if (details) rendered = { run, details }; },
+    onError: error => { throw error; }, delay: noWait });
+  for (let i = 0; i < 5 && !rendered; i++) await tick();
+  await tick();
+  assert.equal(statusReads, 1);
+  assert.equal(rendered.run.passed_count + rendered.run.failed_count, 20);
+  assert.deepEqual(rendered.details, backendFailures);
+}
+
 // A request that resolves after a newer execution becomes current cannot update UI.
 {
   let resolveOld, current = true, updates = 0;

@@ -1,4 +1,5 @@
 import json, logging, mimetypes, re
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
@@ -9,10 +10,11 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 from app.config import settings
-from app.database import Base, engine, get_db
+from app.database import Base, engine, get_db, SessionLocal
 from app.models import Correction, Credential, Dataset, Execution, Job, Rule, WorkflowSelection
-from app.processing import execute, parse_data
+from app.processing import destination_for_job, encode_csv, execute, parse_data
 from app.rules import RULE_TYPES, rule_signature, validate_rule_definition
+from app.connectors.destinations import read_databricks_table, write_destination
 from app.schemas import CorrectionCreate, CredentialCreate, JobConfiguration, JobCreate, JobUpdate, RuleCreate, RuleUpdate, normalize_platform
 from app.connectors.storage import LocalStorage, get_storage, get_source_adapter
 
@@ -33,6 +35,12 @@ async def lifespan(app):
         if "rule_snapshot" not in {column["name"] for column in inspect(engine).get_columns("executions")}:
             with engine.begin() as connection:
                 connection.exec_driver_sql("ALTER TABLE executions ADD COLUMN rule_snapshot JSON")
+    # BackgroundTasks are process-local. Resume persisted queued executions
+    # after a restart; execute() atomically claims each row before doing work.
+    with SessionLocal() as db:
+        queued_ids = list(db.scalars(select(Execution.id).where(Execution.status == "queued")))
+    for execution_id in queued_ids:
+        asyncio.create_task(asyncio.to_thread(execute, execution_id))
     yield
 
 
@@ -731,6 +739,11 @@ async def generate_rule_suggestions(datasets, db, selected_columns=None):
 @app.post("/api/v1/jobs/{job_id}/execute", status_code=202)
 def run_job(job_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
     not_found(db.get(Job, job_id), "Job")
+    active = db.scalar(select(Execution.id).where(
+        Execution.job_id == job_id, Execution.status.in_(("queued", "running"))
+    ).limit(1))
+    if active is not None:
+        raise HTTPException(409, f"Job already has an active execution ({active})")
     record = Execution(job_id=job_id, status="queued", rule_snapshot=rule_snapshot(db, job_id))
     db.add(record); db.commit(); db.refresh(record)
     tasks.add_task(execute, record.id)
@@ -741,6 +754,11 @@ def run_job(job_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
 def retry_execution(execution_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
     previous=not_found(db.get(Execution,execution_id),"Execution")
     if previous.status != "failed": raise HTTPException(409,"Only failed executions can be retried")
+    active = db.scalar(select(Execution.id).where(
+        Execution.job_id == previous.job_id, Execution.status.in_(("queued", "running"))
+    ).limit(1))
+    if active is not None:
+        raise HTTPException(409, f"Job already has an active execution ({active})")
     retry=Execution(job_id=previous.job_id,status="queued",attempt=previous.attempt+1,retry_of=previous.id,
                     rule_snapshot=previous.rule_snapshot if previous.rule_snapshot is not None else rule_snapshot(db, previous.job_id))
     db.add(retry);db.commit();db.refresh(retry);tasks.add_task(execute,retry.id);return retry
@@ -766,14 +784,58 @@ def rule_snapshot(db: Session, job_id: int):
 
 
 @app.get("/api/v1/executions/{execution_id}")
-def execution_detail(execution_id: int, db: Session = Depends(get_db)):
-    return not_found(db.get(Execution, execution_id), "Execution")
+def execution_detail(execution_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    execution = not_found(db.get(Execution, execution_id), "Execution")
+    # BackgroundTasks are process local. A queued row may outlive its request
+    # task (for example, after a worker restart). Polling the persisted row
+    # safely re-dispatches it; execute() atomically claims queued rows, so
+    # duplicate dispatches cannot run the same execution twice.
+    if execution.status == "queued":
+        tasks.add_task(execute, execution.id)
+    return execution
 
 
 @app.get("/api/v1/executions/{execution_id}/failed")
 def failed_records(execution_id: int, db: Session = Depends(get_db)):
     e=not_found(db.get(Execution, execution_id), "Execution")
     if not e.report_path: raise HTTPException(409, "Execution has no saved outputs")
+    job=not_found(db.get(Job,e.job_id),"Job")
+    destination=destination_for_job(job)
+    if destination.get("type")=="databricks":
+        report=json.loads(LocalStorage().read(e.report_path))
+        result=report.get("destination_result") or {}
+        if result.get("type")!="databricks" or not result.get("failed_table"):
+            raise HTTPException(409,"Execution has no saved Databricks FAIL table")
+        secrets={}
+        credential=db.get(Credential,destination.get("credential_id")) if destination.get("credential_id") else None
+        if credential:
+            if not settings.secret_encryption_key: raise HTTPException(500,"SECRET_ENCRYPTION_KEY is required for encrypted cloud credentials")
+            secrets=json.loads(Fernet(settings.secret_encryption_key.encode()).decrypt(credential.secret_ciphertext.encode()))
+            destination={**(credential.config or {}),**destination}
+        else:
+            destination={**destination,"server_hostname":destination.get("server_hostname") or settings.databricks_server_hostname,
+                "http_path":destination.get("http_path") or settings.databricks_http_path,
+                "catalog":result.get("catalog") or destination.get("catalog") or settings.databricks_catalog,
+                "schema":result.get("schema") or destination.get("schema") or settings.databricks_schema}
+            secrets={"access_token":settings.databricks_token} if settings.databricks_token else {}
+        try:
+            remote=read_databricks_table(destination,secrets,result["failed_table"])
+        except Exception as exc:
+            raise HTTPException(502,"Could not load failed records from the Databricks execution table") from exc
+        output=[]
+        for row in remote:
+            index=row.get("_dq_row_index")
+            if index is None: raise HTTPException(502,"Databricks FAIL table is missing original row indexes")
+            reasons=row.get("_dq_failure_reasons")
+            try: reasons=json.loads(reasons) if isinstance(reasons,str) else reasons
+            except (TypeError,ValueError): reasons=[]
+            record={k:v for k,v in row.items() if not k.startswith("_dq_")}
+            output.append({"row_index":int(index),"record":record,"failure_reasons":reasons or []})
+        by_index={item["row_index"]:item for item in output}
+        for correction in db.scalars(select(Correction).where(Correction.execution_id==execution_id).order_by(Correction.id)):
+            if correction.row_index in by_index:
+                by_index[correction.row_index]["record"][correction.column_name]=correction.new_value
+        return output
     path=Path(e.report_path).parent / "failed.json"
     try: return json.loads(LocalStorage().read(str(path)))
     except FileNotFoundError: raise HTTPException(404, "Failed records output not found")
@@ -815,8 +877,19 @@ def revalidate(execution_id: int, db: Session = Depends(get_db)):
     if not e.report_path: raise HTTPException(409, "Execution has no saved outputs")
     path=Path(e.report_path).parent / "failed.json"
     rows=json.loads(LocalStorage().read(str(path)))
-    records=[r["record"] for r in rows]
     job=db.get(Job,e.job_id)
+    destination=destination_for_job(job)
+    # failed.json is the execution-scoped correction source of truth. The
+    # failed-record endpoint may read the Databricks table for display, but
+    # revalidation must not read it again: that extra SQL session duplicated
+    # work immediately before the write and discarded already saved edits.
+    # Overlay history so corrections saved by older clients are honored too.
+    by_index={item["row_index"]:item for item in rows}
+    for correction in db.scalars(select(Correction).where(Correction.execution_id==execution_id).order_by(Correction.id)):
+        if correction.row_index in by_index:
+            by_index[correction.row_index]["record"][correction.column_name]=correction.new_value
+    rows=list(by_index.values())
+    records=[r["record"] for r in rows]
     if e.rule_snapshot is not None:
         from types import SimpleNamespace
         rules=[SimpleNamespace(**item) for item in e.rule_snapshot]
@@ -825,13 +898,96 @@ def revalidate(execution_id: int, db: Session = Depends(get_db)):
         if job.dataset_ids:
             scope.append(Rule.dataset_id.in_(job.dataset_ids))
         rules=list(db.scalars(select(Rule).where(Rule.job_id==job.id, or_(*scope))))
+    selected_columns=job.selected_columns or {}
+    def applies(rule):
+        if not rule.enabled or not rule.approved: return False
+        if rule.dataset_id is not None:
+            columns=selected_columns.get(str(rule.dataset_id), selected_columns.get(rule.dataset_id, []))
+            return not columns or rule.column_name in columns
+        return not selected_columns or any(rule.column_name in columns for columns in selected_columns.values())
+    rules=[rule for rule in rules if applies(rule)]
+    unique_rules=[]; seen_signatures=set()
+    for rule in rules:
+        signature=rule_signature(rule)
+        if signature not in seen_signatures: unique_rules.append(rule); seen_signatures.add(signature)
+    rules=unique_rules
     from app.rules import validate_records
     passed,failed=validate_records(records,rules)
+    # validate_records indexes the supplied subset; restore the original source
+    # row positions so retries/revalidation replace the same execution rows.
+    newly_failed_positions={item["row_index"] for item in failed}
+    newly_passed_indices=[rows[index]["row_index"] for index in range(len(rows))
+                          if index not in newly_failed_positions]
+    for item in failed:
+        item["row_index"] = rows[item["row_index"]]["row_index"]
     root=Path(settings.local_data_dir).resolve(); base=Path(e.report_path).parent
     local=LocalStorage()
-    local.save(str((base/"revalidated_passed.csv").relative_to(root)),__import__("app.processing",fromlist=["encode_csv"]).encode_csv(passed))
-    local.save(str((base/"revalidated_failed.json").relative_to(root)),json.dumps(failed,indent=2).encode())
-    return {"revalidated":len(records),"passed":len(passed),"failed":len(failed)}
+    report=json.loads(local.read(e.report_path))
+    prior_failed_indices={item["row_index"] for item in rows}
+    passed_indices=[index for index in range(report.get("records_loaded",e.passed_count+e.failed_count))
+                    if index not in prior_failed_indices]
+    original_passed=parse_data("passed.csv", local.read(str(base/"passed.csv")))
+    all_passed=original_passed+passed
+    all_failed=failed
+    destination=destination_for_job(job)
+    provider=destination.get("type","local")
+    secrets={}
+    if provider != "local":
+        credential_id=destination.get("credential_id")
+        credential=db.get(Credential,credential_id) if credential_id else None
+        if credential:
+            if not settings.secret_encryption_key:
+                raise HTTPException(500,"SECRET_ENCRYPTION_KEY is required for encrypted cloud credentials")
+            secrets=json.loads(Fernet(settings.secret_encryption_key.encode()).decrypt(credential.secret_ciphertext.encode()))
+            destination={**(credential.config or {}),**destination}
+        elif provider == "databricks":
+            destination={**destination,
+                "server_hostname":destination.get("server_hostname") or settings.databricks_server_hostname,
+                "http_path":destination.get("http_path") or settings.databricks_http_path,
+                "catalog":destination.get("catalog") or settings.databricks_catalog,
+                "schema":destination.get("schema") or settings.databricks_schema}
+            secrets={"access_token":settings.databricks_token} if settings.databricks_token else {}
+        else:
+            raise HTTPException(422,f"Destination {provider} requires a saved credential")
+    source_datasets=[db.get(Dataset,dataset_id) for dataset_id in (job.dataset_ids or [])]
+    dataset_label="_and_".join(item.name for item in source_datasets if item)
+    storage_run_id=e.id
+    parent=db.get(Execution,e.retry_of) if e.retry_of else None
+    while parent:
+        storage_run_id=parent.id
+        parent=db.get(Execution,parent.retry_of) if parent.retry_of else None
+    try:
+        remote=write_destination(destination,secrets,str(base),all_passed,all_failed,report,encode_csv(all_passed),
+            dataset_name=dataset_label or job.name,job_id=job.id,execution_id=e.id,
+            columns=list(dict.fromkeys(k for row in all_passed for k in row)),
+            source_dataset_ids=[item.id for item in source_datasets if item],storage_run_id=storage_run_id,
+            passed_row_indices=passed_indices + newly_passed_indices,
+            atomic_update=provider=="databricks")
+        report["destination_result"]=remote
+        report["storage_status"]={"status":"saved","pass_status":remote.get("pass_status","saved"),"fail_status":remote.get("fail_status","saved")}
+        e.status="succeeded";e.error=None
+    except Exception as exc:
+        # Do not publish changed local outcomes or counts when the destination
+        # could not persist them. The failed artifact remains the retry source.
+        db.rollback()
+        raise HTTPException(502, "Destination storage failed; corrections remain saved. Retry revalidation after fixing the destination.") from exc
+    local.save(str((base/"revalidated_passed.csv").relative_to(root)),encode_csv(passed))
+    local.save(str((base/"revalidated_failed.json").relative_to(root)),json.dumps(failed,ensure_ascii=False,indent=2).encode())
+    passed_path=local.save(str((base/"passed.csv").relative_to(root)),encode_csv(all_passed))
+    failed_path=local.save(str((base/"failed.json").relative_to(root)),json.dumps(all_failed,ensure_ascii=False,indent=2).encode())
+    report.update(status=e.status,passed=len(all_passed),failed=len(all_failed),
+                   total=len(all_passed)+len(all_failed),records_evaluated=len(all_passed)+len(all_failed),
+                   passed_path=passed_path,failed_path=failed_path)
+    output_dataset=db.get(Dataset,report.get("output_dataset_id"))
+    if output_dataset:
+        output_dataset.schema_json={"columns":{column:{"inferred_type":"string","nullable":any(row.get(column) in (None,"") for row in all_passed)} for column in dict.fromkeys(k for row in all_passed for k in row)},"row_count":len(all_passed)}
+    local.save(str((base/"report.json").relative_to(root)),json.dumps(report,ensure_ascii=False,indent=2).encode())
+    e.passed_count=len(all_passed);e.failed_count=len(all_failed)
+    if not all_failed and e.status=="succeeded": e.error=None
+    e.logs=(e.logs or [])+[f"Revalidated {len(records)} corrected records; {len(all_passed)} passed; {len(all_failed)} failed",f"Destination storage {report['storage_status']['status']}"]
+    db.commit()
+    return {"revalidated":len(records),"passed":len(passed),"failed":len(failed),
+            "total_passed":len(all_passed),"total_failed":len(all_failed),"storage_status":report["storage_status"]}
 
 
 @app.get("/api/v1/executions/{execution_id}/corrections")

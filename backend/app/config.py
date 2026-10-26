@@ -7,7 +7,9 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 class Settings(BaseSettings):
     # Resolve the project file from this module, not from the backend process cwd.
     model_config = SettingsConfigDict(
-        env_file=Path(__file__).resolve().parent.parent / ".env",
+        # The local dotenv stays at the repository root so project tools and the
+        # backend share one configuration file.
+        env_file=Path(__file__).resolve().parents[2] / ".env",
         env_file_encoding="utf-8-sig",
         extra="ignore",
     )

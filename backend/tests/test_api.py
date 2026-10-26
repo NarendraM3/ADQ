@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 from app.main import app
 from app.config import settings
 from app.database import Base, get_db
-from app.models import Dataset, Job, Rule
+from app.models import Dataset, Execution, Job, Rule
 from app.schemas import JobCreate
 from app.main import validate_job_inputs
 import app.processing as processing
@@ -27,6 +27,87 @@ def test_capabilities_and_health():
     assert client.get("/health").json()["local_workflow"] == "ready"
     body = client.get("/api/v1/capabilities").json()
     assert body["destinations"]["local"] == "ready"
+
+
+def test_slow_databricks_revalidation_uses_saved_rows_and_same_execution(monkeypatch, test_data_dir):
+    """A slow output write does not trigger a redundant FAIL read or a new run."""
+    import json
+    import time
+    from pathlib import Path
+    import app.main as main
+
+    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    Base.metadata.create_all(test_engine)
+    monkeypatch.setattr(settings, "local_data_dir", str(test_data_dir / "data"))
+
+    def override_db():
+        with TestingSession() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        with TestingSession() as db:
+            dataset = Dataset(name="employees", filename="employees.csv", path="employees.csv",
+                              schema_json={"columns": {"email": {}}})
+            db.add(dataset)
+            db.flush()
+            dataset_id = dataset.id
+            job = Job(name="slow Databricks", dataset_ids=[dataset.id], selected_columns={str(dataset.id): ["email"]},
+                      destination={"type": "databricks"})
+            db.add(job)
+            db.flush()
+            execution = Execution(job_id=job.id, status="succeeded", passed_count=0, failed_count=1,
+                                  rule_snapshot=[{"id": 1, "job_id": job.id, "dataset_id": dataset.id,
+                                      "column_name": "email", "rule_type": "EMAIL_FORMAT",
+                                      "parameters": {}, "enabled": True, "approved": True}])
+            db.add(execution)
+            db.flush()
+            execution_id = execution.id
+            execution.report_path = str(test_data_dir / "data" / "outputs" / "execution" / "report.json")
+            db.commit()
+
+        base = Path(execution.report_path).parent
+        base.mkdir(parents=True)
+        (base / "passed.csv").write_text("email\n", encoding="utf-8")
+        (base / "failed.json").write_text(json.dumps([{
+            "row_index": 27, "record": {"email": "bad"},
+            "failure_reasons": ["Invalid email format: 'bad' is not a valid email address."],
+        }]), encoding="utf-8")
+        (base / "report.json").write_text(json.dumps({"records_loaded": 1, "output_dataset_id": dataset_id,
+            "destination_result": {"type": "databricks", "failed_table": "employees_fail"}}), encoding="utf-8")
+
+        def unexpected_remote_read(*args, **kwargs):
+            raise AssertionError("revalidation must not reread the Databricks FAIL table")
+
+        captured = {}
+        def slow_write(destination, secrets, run_path, passed, failed, report, csv_bytes, **kwargs):
+            time.sleep(0.05)
+            captured.update(destination=destination, execution_id=kwargs["execution_id"],
+                            passed=passed, failed=failed)
+            return {"type": "databricks", "status": "saved", "pass_status": "saved",
+                    "fail_status": "saved", "passed_table": "employees_pass", "failed_table": "employees_fail"}
+
+        monkeypatch.setattr(main, "read_databricks_table", unexpected_remote_read)
+        monkeypatch.setattr(main, "write_destination", slow_write)
+        client = TestClient(app)
+        saved = client.post(f"/api/v1/executions/{execution_id}/corrections", json={
+            "row_index": 27, "column_name": "email", "value": "fixed@example.com"})
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["row_index"] == 27
+
+        response = client.post(f"/api/v1/executions/{execution_id}/revalidate")
+        assert response.status_code == 200, response.text
+        assert response.json()["total_passed"] == 1 and response.json()["total_failed"] == 0
+        assert captured["execution_id"] == execution_id
+        assert captured["passed"] == [{"email": "fixed@example.com"}]
+        assert captured["failed"] == []
+        assert client.get(f"/api/v1/executions/{execution_id}/artifacts/revalidated_failed.json").json() == []
+        assert client.get(f"/api/v1/executions/{execution_id}").json()["passed_count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        Base.metadata.drop_all(test_engine)
+        test_engine.dispose()
 
 
 def test_job_selection_is_explicit_and_columns_keep_dataset_association():
@@ -135,10 +216,9 @@ def test_rule_snapshot_is_scoped_to_job_and_selected_datasets():
         test_engine.dispose()
 
 
-def test_job_environment_persists_on_create_edit_list_and_execution(monkeypatch):
+def test_job_environment_persists_on_create_edit_list_and_execution(monkeypatch, test_data_dir):
     from pathlib import Path
-    test_data = Path(".test-data").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(processing, "SessionLocal", TestingSession)
@@ -232,10 +312,9 @@ def test_job_environment_persists_on_create_edit_list_and_execution(monkeypatch)
         app.dependency_overrides.pop(get_db, None)
 
 
-def test_local_file_job_execution(monkeypatch):
+def test_local_file_job_execution(monkeypatch, test_data_dir):
     from pathlib import Path
-    test_data = Path(".test-data").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(processing, "SessionLocal", TestingSession)
@@ -272,7 +351,12 @@ def test_local_file_job_execution(monkeypatch):
         assert correction.status_code == 200
         assert len(client.get(f"/api/v1/executions/{execution_id}/corrections").json()) == 1
         rechecked=client.post(f"/api/v1/executions/{execution_id}/revalidate").json()
-        assert rechecked == {"revalidated":1,"passed":1,"failed":0}
+        assert rechecked["revalidated"] == 1
+        assert rechecked["passed"] == 1 and rechecked["failed"] == 0
+        assert rechecked["total_passed"] == 2 and rechecked["total_failed"] == 0
+        assert client.get(f"/api/v1/executions/{execution_id}/failed").json() == []
+        refreshed=client.get(f"/api/v1/executions/{execution_id}").json()
+        assert refreshed["passed_count"] == 2 and refreshed["failed_count"] == 0
         output=client.get(f"/api/v1/executions/{execution_id}/artifacts/passed.csv")
         assert output.status_code == 200 and b"good@example.com" in output.content
         second=client.post("/api/v1/datasets/upload",files={"file":("tiers.csv",b"email,tier\ngood@example.com,gold\nunused@example.com,silver\n","text/csv")})
@@ -300,11 +384,58 @@ def test_local_file_job_execution(monkeypatch):
         test_engine.dispose()
 
 
-def test_approved_rules_validate_customer_csv_with_record_counts(monkeypatch):
+def test_polling_restarts_a_persisted_queued_execution(monkeypatch, test_data_dir):
+    """A missed process-local background task is recovered by status polling."""
+    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr(processing, "SessionLocal", TestingSession)
+    Base.metadata.create_all(test_engine)
+    monkeypatch.setattr(settings, "local_data_dir", str(test_data_dir / "data"))
+
+    def override_db():
+        with TestingSession() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        upload = client.post("/api/v1/datasets/upload", files={
+            "file": ("queued.csv", b"email\na@example.com\nbad\n", "text/csv")})
+        job = client.post("/api/v1/jobs", json={
+            "name": "queued recovery", "dataset_ids": [upload.json()["id"]], "destination": {"type": "local"}})
+        rule = client.post(f"/api/v1/jobs/{job.json()['id']}/rules", json={
+            "column_name": "email", "rule_type": "EMAIL_FORMAT", "enabled": True, "approved": True})
+        assert upload.status_code == 201 and job.status_code == 201 and rule.status_code == 201
+
+        # Simulate a persisted QUEUED row whose original process-local task was lost.
+        with TestingSession() as db:
+            execution = Execution(job_id=job.json()["id"], status="queued", rule_snapshot=[{
+                "id": rule.json()["id"], "job_id": job.json()["id"], "dataset_id": upload.json()["id"],
+                "column_name": "email", "rule_type": "EMAIL_FORMAT", "parameters": {},
+                "enabled": True, "approved": True,
+            }])
+            db.add(execution)
+            db.commit()
+            execution_id = execution.id
+
+        # The GET response is serialized before its background task runs; the
+        # next status poll must read the committed terminal state.
+        client.get(f"/api/v1/executions/{execution_id}")
+        recovered = client.get(f"/api/v1/executions/{execution_id}").json()
+        assert recovered["status"] == "succeeded"
+        assert (recovered["passed_count"], recovered["failed_count"]) == (1, 1)
+        details = client.get(f"/api/v1/executions/{execution_id}/failed").json()
+        assert details[0]["failure_reasons"]
+    finally:
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(test_engine)
+        test_engine.dispose()
+
+
+def test_approved_rules_validate_customer_csv_with_record_counts(monkeypatch, test_data_dir):
     from pathlib import Path
 
-    test_data = Path(".test-data-approved").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(processing, "SessionLocal", TestingSession)
@@ -385,11 +516,10 @@ def test_approved_rules_validate_customer_csv_with_record_counts(monkeypatch):
         test_engine.dispose()
 
 
-def test_zero_approved_rules_are_incomplete_not_passed(monkeypatch):
+def test_zero_approved_rules_are_incomplete_not_passed(monkeypatch, test_data_dir):
     from pathlib import Path
 
-    test_data = Path(".test-data-no-rules").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(processing, "SessionLocal", TestingSession)
@@ -429,10 +559,9 @@ def test_zero_approved_rules_are_incomplete_not_passed(monkeypatch):
         test_engine.dispose()
 
 
-def test_employee_baseline_is_idempotent_and_validates_25_records(monkeypatch):
+def test_employee_baseline_is_idempotent_and_validates_25_records(monkeypatch, test_data_dir):
     from pathlib import Path
-    test_data = Path(".test-data-employee-baseline").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(processing, "SessionLocal", TestingSession)
@@ -505,12 +634,11 @@ def test_employee_baseline_is_idempotent_and_validates_25_records(monkeypatch):
         test_engine.dispose()
 
 
-def test_generated_rules_are_approved_and_scoped_to_each_new_job(monkeypatch):
+def test_generated_rules_are_approved_and_scoped_to_each_new_job(monkeypatch, test_data_dir):
     from pathlib import Path
     import app.main as main
 
-    test_data = Path(".test-data-generated").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(processing, "SessionLocal", TestingSession)

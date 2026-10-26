@@ -6,6 +6,7 @@ export function pollExecution({ executionId, getExecution, getFailed, onUpdate, 
   const cancel = () => { stopped = true; };
   const run = async () => {
     let wait = 1000;
+    let pollDelay = 1500;
     while (current()) {
       try {
         const result = await getExecution(executionId);
@@ -20,7 +21,8 @@ export function pollExecution({ executionId, getExecution, getFailed, onUpdate, 
           }
           return cancel;
         }
-        await delay(1500);
+        await delay(pollDelay);
+        pollDelay = Math.min(Math.round(pollDelay * 1.5), 5000);
       } catch (error) {
         if (!current()) return cancel;
         onError(error, false);

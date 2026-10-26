@@ -1,4 +1,4 @@
-from app.connectors.destinations import _table_name, _write_databricks_table, write_destination
+from app.connectors.destinations import _bypass_proxy_for_host, _table_name, _write_databricks_table, write_destination
 
 
 class Cursor:
@@ -32,6 +32,14 @@ def test_table_names_are_dynamic_and_execution_scoped():
     assert one == "employee_dataset_job_4_execution_12_pass"
     assert another != one
     assert _table_name("Employee Dataset", 4, 12, "fail") != one
+
+
+def test_databricks_host_is_added_to_proxy_bypass_without_dropping_existing_hosts(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    _bypass_proxy_for_host("workspace.example")
+    assert "workspace.example" in __import__("os").environ["NO_PROXY"]
+    assert "workspace.example" in __import__("os").environ["no_proxy"]
+    assert "localhost" in __import__("os").environ["NO_PROXY"]
 
 
 def test_table_writer_keeps_columns_values_types_and_failure_metadata():

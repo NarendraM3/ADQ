@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import logging
 from types import SimpleNamespace
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from app.config import settings
 from app.connectors.storage import LocalStorage
 from app.connectors.destinations import write_destination
@@ -168,15 +168,21 @@ def destination_for_job(job):
 def execute(execution_id: int):
     db = SessionLocal()
     try:
+        # Claim queued work atomically. A duplicate task (or startup recovery
+        # racing the original request) must never execute the same run twice.
+        claimed = db.execute(update(Execution).where(
+            Execution.id == execution_id, Execution.status == "queued"
+        ).values(status="running", started_at=datetime.now(timezone.utc),
+                 logs=["Execution started"]))
+        db.commit()
+        if claimed.rowcount != 1:
+            return
         execution = db.get(Execution, execution_id)
         if execution is None:
             raise ValueError(f"Execution {execution_id} does not exist")
         job = db.get(Job, execution.job_id)
         if job is None:
             raise ValueError(f"Job for execution {execution_id} does not exist")
-        execution.status = "running"; execution.started_at = datetime.now(timezone.utc)
-        execution.logs = ["Execution started"]
-        db.commit()
         destination=destination_for_job(job)
         datasets = [db.get(Dataset, did) for did in (job.dataset_ids or [])]
         if not datasets:

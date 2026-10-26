@@ -94,7 +94,7 @@ def test_s3_get_object_body_is_bytes_and_parses_without_changing_columns(monkeyp
     assert parse_data("optional.csv", b"optional field,other field\n,kept\n") == [{"optional field": "", "other field": "kept"}]
 
 
-def test_execution_union_with_selected_columns_does_not_require_join_keys(monkeypatch):
+def test_execution_union_with_selected_columns_does_not_require_join_keys(monkeypatch, test_data_dir):
     from pathlib import Path
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -107,8 +107,7 @@ def test_execution_union_with_selected_columns_does_not_require_join_keys(monkey
     monkeypatch.setattr(settings, "databricks_http_path", None)
     monkeypatch.setattr(settings, "databricks_token", None)
 
-    test_data = Path(".test-data-processing").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Session = sessionmaker(bind=engine, expire_on_commit=False)
     Base.metadata.create_all(engine)
@@ -192,7 +191,7 @@ def test_execution_union_with_selected_columns_does_not_require_join_keys(monkey
         engine.dispose()
 
 
-def test_execution_join_selection_and_validation_are_the_records_sent_to_storage(monkeypatch):
+def test_execution_join_selection_and_validation_are_the_records_sent_to_storage(monkeypatch, test_data_dir):
     from pathlib import Path
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -202,8 +201,7 @@ def test_execution_join_selection_and_validation_are_the_records_sent_to_storage
     from app.models import Dataset, Execution, Job
     from app.config import settings
 
-    test_data = Path(".test-data-processing").resolve()
-    test_data.mkdir(exist_ok=True)
+    test_data = test_data_dir
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Session = sessionmaker(bind=engine, expire_on_commit=False)
     Base.metadata.create_all(engine)

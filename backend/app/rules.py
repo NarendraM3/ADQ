@@ -93,6 +93,12 @@ def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
         if signature in executed:
             continue
         executed.add(signature)
+        compiled_pattern = re.compile(params["pattern"]) if kind == "REGEX" and params.get("pattern") else None
+        accepted_values = None
+        if kind == "IN_SET":
+            accepted_values = {str(item).strip() for item in params.get("values", [])}
+            if params.get("case_sensitive", True) is False:
+                accepted_values = {item.casefold() for item in accepted_values}
         # Resolve once against the actual execution records. Missing or ambiguous
         # columns are configuration errors, never row-level null values.
         resolved = resolve_column(records[0], col) if records else None
@@ -139,19 +145,17 @@ def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
                     elif params.get("max") is not None and num > float(params["max"]): reason = f"Invalid {col}: {shown} is above the allowed maximum of {params['max']}."
                 except (ValueError, TypeError, OverflowError):
                     reason = f"Invalid {col}: {shown} must be numeric for the configured range."
-            elif kind == "REGEX" and params.get("pattern") and not re.fullmatch(params["pattern"], text):
+            elif kind == "REGEX" and compiled_pattern and not compiled_pattern.fullmatch(text):
                 reason = f"{col} does not match required pattern"
             elif kind == "LENGTH":
                 n = len(text)
                 if params.get("min") is not None and n < int(params["min"]): reason = f"{col} is shorter than {params['min']}"
                 elif params.get("max") is not None and n > int(params["max"]): reason = f"{col} is longer than {params['max']}"
             elif kind == "IN_SET":
-                accepted = {str(item).strip() for item in params.get("values", [])}
                 candidate = text
                 if params.get("case_sensitive", True) is False:
-                    accepted = {item.casefold() for item in accepted}
                     candidate = candidate.casefold()
-                if candidate not in accepted: reason = f"{col} value {shown} is not in the allowed values."
+                if candidate not in accepted_values: reason = f"{col} value {shown} is not in the allowed values."
             if reason:
                 reasons = failures.setdefault(idx, [])
                 if reason not in reasons:
