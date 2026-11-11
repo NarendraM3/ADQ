@@ -1,5 +1,10 @@
 const terminalStatuses = new Set(['succeeded', 'incomplete', 'failed']);
 
+export function executionTotal(run) {
+  if (!run || run.status === 'queued' || run.status === 'running' || run.status === 'incomplete') return null;
+  return (run.passed_count || 0) + (run.failed_count || 0);
+}
+
 export function pollExecution({ executionId, getExecution, getFailed, onUpdate, onError, isCurrent = () => true, delay = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   let stopped = false;
   const current = () => !stopped && isCurrent();

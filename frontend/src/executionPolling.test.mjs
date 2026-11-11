@@ -1,16 +1,22 @@
 import assert from 'node:assert/strict';
-import { pollExecution } from './executionPolling.mjs';
+import { executionTotal, pollExecution } from './executionPolling.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const noWait = async () => {};
+
+assert.equal(executionTotal({ status: 'queued', passed_count: 0, failed_count: 0 }), null,
+  'queued executions must not show a final total of zero');
+assert.equal(executionTotal({ status: 'running', passed_count: 0, failed_count: 0 }), null,
+  'running executions must not show a final total of zero');
+assert.equal(executionTotal({ status: 'succeeded', passed_count: 8, failed_count: 2 }), 10);
 
 // Poll the exact ID through queued and running states, then apply counts/details.
 {
   const ids = [], updates = [];
   const states = [
-    { id: 42, status: 'queued', passed_count: 0, failed_count: 0 },
-    { id: 42, status: 'running', passed_count: 0, failed_count: 0 },
-    { id: 42, status: 'succeeded', passed_count: 8, failed_count: 2 },
+    { id: 42, status: 'queued', stage: 'queued', passed_count: 0, failed_count: 0 },
+    { id: 42, status: 'running', stage: 'validating_records', progress_completed: 20, progress_total: 100, passed_count: 0, failed_count: 0 },
+    { id: 42, status: 'succeeded', stage: 'completed', passed_count: 8, failed_count: 2 },
   ];
   pollExecution({ executionId: 42, getExecution: async id => { ids.push(id); return states.shift(); },
     getFailed: async id => { ids.push(id); return [{ row_index: 4, record: { EmployeeID: 'E5' }, failure_reasons: ['Email invalid'] }]; },
@@ -19,6 +25,8 @@ const noWait = async () => {};
   assert.deepEqual(ids, [42, 42, 42, 42]);
   assert.equal(updates.at(-1).run.passed_count + updates.at(-1).run.failed_count, 10);
   assert.equal(updates.at(-1).details[0].failure_reasons[0], 'Email invalid');
+  assert.equal(updates[0].run.stage, 'queued');
+  assert.deepEqual([updates[1].run.progress_completed, updates[1].run.progress_total], [20, 100]);
 }
 
 // Polling continues beyond 20 reads until a real terminal state.
