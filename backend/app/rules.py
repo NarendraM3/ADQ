@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-RULE_TYPES = {"NOT_NULL", "UNIQUE", "DATA_TYPE", "RANGE", "EMAIL_FORMAT", "DUPLICATES", "REGEX", "LENGTH", "IN_SET"}
+RULE_TYPES = {"NOT_NULL", "UNIQUE", "DATA_TYPE", "MIN_VALUE", "MAX_VALUE", "RANGE", "EMAIL_FORMAT", "DUPLICATES", "REGEX", "LENGTH", "IN_SET"}
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
@@ -53,6 +53,14 @@ def validate_rule_definition(kind: str, params: dict):
     if kind not in RULE_TYPES: raise ValueError("Unsupported rule type")
     if kind == "DATA_TYPE" and str(params.get("type", "string")).lower() not in {"string", "str", "int", "integer", "float", "number", "decimal", "bool", "boolean", "date", "datetime"}:
         raise ValueError("DATA_TYPE type must be string, integer, number, boolean, date, or datetime")
+    if kind in ("MIN_VALUE", "MAX_VALUE"):
+        bound = "min" if kind == "MIN_VALUE" else "max"
+        if params.get(bound) is None and params.get("value") is None:
+            raise ValueError(f"{kind} requires a {bound} or value parameter")
+        try:
+            float(params.get(bound, params.get("value")))
+        except (ValueError, TypeError):
+            raise ValueError(f"{bound} must be numeric")
     if kind in ("RANGE", "LENGTH"):
         for bound in ("min", "max"):
             if params.get(bound) is not None:
@@ -73,6 +81,42 @@ def _number(value):
     if not math.isfinite(number):
         raise ValueError("non-finite number")
     return number
+
+
+def _add_failure(failures, idx, rule, column, value, reason, expected):
+    entry = failures.setdefault(idx, {"reasons": [], "details": []})
+    if reason not in entry["reasons"]:
+        entry["reasons"].append(reason)
+    entry["details"].append({
+        "rule_id": getattr(rule, "id", None),
+        "dataset_id": getattr(rule, "dataset_id", None),
+        "column_name": column,
+        "rule_type": rule.rule_type.upper(),
+        "expected": expected,
+        "actual_value": value,
+        "reason": reason,
+    })
+
+
+def _missing_failure(kind, col, params):
+    if kind in {"NOT_NULL", "EMAIL_FORMAT"}:
+        return f"Missing required {col}: the {col} field is empty.", "non-missing value"
+    if kind == "DATA_TYPE":
+        typ = str(params.get("type", params.get("expected_type", "string"))).lower()
+        return f"Invalid {col}: missing value cannot be parsed as {typ}.", f"type {typ}"
+    if kind == "MIN_VALUE":
+        return f"Invalid {col}: missing value must be numeric for the configured minimum.", {"min": params.get("min", params.get("value"))}
+    if kind == "MAX_VALUE":
+        return f"Invalid {col}: missing value must be numeric for the configured maximum.", {"max": params.get("max", params.get("value"))}
+    if kind == "RANGE":
+        return f"Invalid {col}: missing value must be numeric for the configured range.", {"min": params.get("min"), "max": params.get("max")}
+    if kind == "REGEX":
+        return f"{col} does not match required pattern because the value is missing.", params.get("pattern")
+    if kind == "LENGTH":
+        return f"{col} does not meet the configured length because the value is missing.", {"min": params.get("min"), "max": params.get("max")}
+    if kind == "IN_SET":
+        return f"{col} value is missing and is not in the allowed values.", list(params.get("values", []))
+    return None, None
 
 
 def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
@@ -107,13 +151,9 @@ def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
             actual_col = resolved if resolved in row else resolve_column(row, col)
             value = row.get(actual_col)
             if is_missing(value):
-                if kind in {"NOT_NULL", "EMAIL_FORMAT"}:
-                    reason = f"Missing required {col}: the {col} field is empty."
-                    reasons = failures.setdefault(idx, [])
-                    if reason not in reasons:
-                        reasons.append(reason)
-                # Missing values are exclusively a required-field failure for
-                # numeric, set, email and duplicate checks.
+                reason, expected = _missing_failure(kind, col, params)
+                if reason:
+                    _add_failure(failures, idx, rule, col, value, reason, expected)
                 continue
             shown = repr(value)
             reason = None
@@ -138,6 +178,22 @@ def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
                         datetime.fromisoformat(text)
                 except (ValueError, TypeError, OverflowError, InvalidOperation):
                     reason = f"Invalid {col}: {shown} cannot be parsed as {typ}."
+            elif kind == "MIN_VALUE":
+                bound = params.get("min", params.get("value"))
+                try:
+                    num = _number(value)
+                    if num < float(bound):
+                        reason = f"Invalid {col}: {shown} is below the allowed minimum of {bound}."
+                except (ValueError, TypeError, OverflowError):
+                    reason = f"Invalid {col}: {shown} must be numeric for the configured minimum."
+            elif kind == "MAX_VALUE":
+                bound = params.get("max", params.get("value"))
+                try:
+                    num = _number(value)
+                    if num > float(bound):
+                        reason = f"Invalid {col}: {shown} is above the allowed maximum of {bound}."
+                except (ValueError, TypeError, OverflowError):
+                    reason = f"Invalid {col}: {shown} must be numeric for the configured maximum."
             elif kind == "RANGE":
                 try:
                     num = _number(value)
@@ -157,15 +213,28 @@ def validate_records(records: list[dict], rules: list) -> tuple[list, list]:
                     candidate = candidate.casefold()
                 if candidate not in accepted_values: reason = f"{col} value {shown} is not in the allowed values."
             if reason:
-                reasons = failures.setdefault(idx, [])
-                if reason not in reasons:
-                    reasons.append(reason)
+                expected = kind
+                if kind == "DATA_TYPE":
+                    expected = f"type {params.get('type', params.get('expected_type', 'string'))}"
+                elif kind == "RANGE":
+                    expected = {"min": params.get("min"), "max": params.get("max")}
+                elif kind == "MIN_VALUE":
+                    expected = {"min": params.get("min", params.get("value"))}
+                elif kind == "MAX_VALUE":
+                    expected = {"max": params.get("max", params.get("value"))}
+                elif kind == "IN_SET":
+                    expected = list(params.get("values", []))
+                elif kind == "REGEX":
+                    expected = params.get("pattern")
+                _add_failure(failures, idx, rule, col, value, reason, expected)
 
     passed, failed = [], []
     for i, record in enumerate(records):
-        reasons = failures.get(i, [])
-        if reasons:
-            failed.append({"row_index": i, "record": record, "failure_reasons": reasons})
+        failure = failures.get(i)
+        if failure:
+            failed.append({"row_index": i, "record": record,
+                           "failure_reasons": failure["reasons"],
+                           "failure_details": failure["details"]})
         else:
             passed.append(record)
     return passed, failed

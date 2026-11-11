@@ -5,6 +5,8 @@ frontend/.env.*
 .venv/
 __pycache__/
 .pytest_cache/
+.pytest-run-tmp/
+.pytest-runtime-data/
 *.py[cod]
 *.db
 data/
@@ -17,3 +19,10 @@ build/
 *.egg-info/
 pytest-cache-files-*/
 .test-data-*/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage*
+coverage.xml
+*.log

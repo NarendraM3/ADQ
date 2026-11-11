@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { displayPlatform, getSelectedPlatform, saveSelectedPlatform } from './platform.js';
+import { displayPlatform, getSelectedPlatform, platformDestinationType, platformKey, saveSelectedPlatform } from './platform.js';
 
 assert.equal(displayPlatform({ environment: 'databricks' }), 'Databricks');
 assert.equal(displayPlatform({ environment: 'DATABRICKS' }), 'Databricks');
 assert.equal(displayPlatform({ environment: 'Microsoft_Fabric' }), 'Microsoft Fabric');
 assert.equal(displayPlatform({ environment: 'Snowflake' }), 'Snowflake');
 assert.equal(displayPlatform({ environment: 'fabric' }), 'Microsoft Fabric');
+assert.equal(platformKey('Microsoft Fabric'), 'fabric');
+assert.equal(platformDestinationType('Snowflake'), 'snowflake');
+assert.equal(platformDestinationType(''), 'local');
 
 assert.equal(displayPlatform({ settings: { platform: 'fabric' }, destination: { type: 'local' } }), 'Microsoft Fabric');
 assert.equal(displayPlatform({ destination: { type: 'local' } }), 'Unspecified');

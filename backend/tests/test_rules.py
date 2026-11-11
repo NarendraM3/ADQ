@@ -123,6 +123,25 @@ def test_exact_duplicate_rule_runs_once_but_distinct_rule_is_preserved():
     assert len(failed) == 1
     assert failed[0]["failure_reasons"].count("Invalid age: '-1' is below the allowed minimum of 0.") == 1
     assert failed[0]["failure_reasons"].count("Invalid age: '-1' is below the allowed minimum of 1.") == 1
+    assert {detail["rule_type"] for detail in failed[0]["failure_details"]} == {"RANGE"}
+
+
+def test_min_and_max_value_rules_are_distinct_from_type_checks():
+    records = [{"amount": "-1"}, {"amount": "11"}, {"amount": "bad"}, {"amount": "5"}]
+    rules = [
+        SimpleNamespace(id=1, dataset_id=None, enabled=True, approved=True, rule_type="DATA_TYPE", column_name="amount", parameters={"type": "number"}),
+        SimpleNamespace(id=2, dataset_id=None, enabled=True, approved=True, rule_type="MIN_VALUE", column_name="amount", parameters={"min": 0}),
+        SimpleNamespace(id=3, dataset_id=None, enabled=True, approved=True, rule_type="MAX_VALUE", column_name="amount", parameters={"max": 10}),
+    ]
+
+    passed, failed = validate_records(records, rules)
+
+    assert passed == [records[3]]
+    assert [item["row_index"] for item in failed] == [0, 1, 2]
+    assert any("below the allowed minimum of 0" in reason for reason in failed[0]["failure_reasons"])
+    assert any("above the allowed maximum of 10" in reason for reason in failed[1]["failure_reasons"])
+    assert any("cannot be parsed as number" in reason for reason in failed[2]["failure_reasons"])
+    assert {detail["rule_id"] for detail in failed[2]["failure_details"]} == {1, 2, 3}
 
 
 def make_rule(kind, column, parameters=None, enabled=True, approved=True):
@@ -197,6 +216,64 @@ def test_pending_and_disabled_rules_are_never_executed():
     passed, failed = validate_records(records, rules)
     assert passed == records
     assert failed == []
+
+
+def test_dynamic_rules_preserve_null_negative_multi_column_failures_and_ignore_inactive_rules():
+    records = [
+        {"required_name": "ok", "numeric_age": "42", "numeric_salary": "90000", "department_code": "A", "city_code": "X", "ignored_field": ""},
+        {"required_name": None, "numeric_age": "42", "numeric_salary": "90000", "department_code": "A", "city_code": "X", "ignored_field": ""},
+        {"required_name": "ok", "numeric_age": None, "numeric_salary": "90000", "department_code": "A", "city_code": "X", "ignored_field": ""},
+        {"required_name": "ok", "numeric_age": "-49", "numeric_salary": "90000", "department_code": "A", "city_code": "X", "ignored_field": ""},
+        {"required_name": "ok", "numeric_age": "42", "numeric_salary": None, "department_code": "A", "city_code": "X", "ignored_field": ""},
+        {"required_name": "ok", "numeric_age": "42", "numeric_salary": "-95895", "department_code": "A", "city_code": "X", "ignored_field": ""},
+        {"required_name": "ok", "numeric_age": "42", "numeric_salary": "90000", "department_code": None, "city_code": "X", "ignored_field": ""},
+        {"required_name": "ok", "numeric_age": "42", "numeric_salary": "90000", "department_code": "A", "city_code": None, "ignored_field": ""},
+        {"required_name": None, "numeric_age": "-1", "numeric_salary": "-145127", "department_code": None, "city_code": None, "ignored_field": ""},
+    ]
+    rules = [
+        SimpleNamespace(id=1, dataset_id=None, enabled=True, approved=True, rule_type="NOT_NULL", column_name="required_name", parameters={}),
+        SimpleNamespace(id=2, dataset_id=None, enabled=True, approved=True, rule_type="NOT_NULL", column_name="numeric_age", parameters={}),
+        SimpleNamespace(id=3, dataset_id=None, enabled=True, approved=True, rule_type="DATA_TYPE", column_name="numeric_age", parameters={"type": "integer"}),
+        SimpleNamespace(id=4, dataset_id=None, enabled=True, approved=True, rule_type="RANGE", column_name="numeric_age", parameters={"min": 0}),
+        SimpleNamespace(id=5, dataset_id=None, enabled=True, approved=True, rule_type="NOT_NULL", column_name="numeric_salary", parameters={}),
+        SimpleNamespace(id=6, dataset_id=None, enabled=True, approved=True, rule_type="DATA_TYPE", column_name="numeric_salary", parameters={"type": "number"}),
+        SimpleNamespace(id=7, dataset_id=None, enabled=True, approved=True, rule_type="MIN_VALUE", column_name="numeric_salary", parameters={"min": 0}),
+        SimpleNamespace(id=8, dataset_id=None, enabled=True, approved=True, rule_type="NOT_NULL", column_name="department_code", parameters={}),
+        SimpleNamespace(id=9, dataset_id=None, enabled=True, approved=True, rule_type="IN_SET", column_name="department_code", parameters={"values": ["A", "B"]}),
+        SimpleNamespace(id=10, dataset_id=None, enabled=True, approved=True, rule_type="NOT_NULL", column_name="city_code", parameters={}),
+        SimpleNamespace(id=11, dataset_id=None, enabled=True, approved=True, rule_type="IN_SET", column_name="city_code", parameters={"values": ["X", "Y"]}),
+        SimpleNamespace(id=12, dataset_id=None, enabled=False, approved=True, rule_type="NOT_NULL", column_name="ignored_field", parameters={}),
+        SimpleNamespace(id=13, dataset_id=None, enabled=True, approved=False, rule_type="NOT_NULL", column_name="ignored_field", parameters={}),
+    ]
+
+    passed, failed = validate_records(records, rules)
+
+    assert passed == [records[0]]
+    assert [item["row_index"] for item in failed] == list(range(1, 9))
+    by_row = {item["row_index"]: item for item in failed}
+    assert any(detail["column_name"] == "required_name" and detail["rule_type"] == "NOT_NULL" for detail in by_row[1]["failure_details"])
+    assert any(detail["column_name"] == "numeric_age" and detail["rule_type"] == "DATA_TYPE" for detail in by_row[2]["failure_details"])
+    assert any(detail["column_name"] == "numeric_age" and detail["rule_type"] == "RANGE" for detail in by_row[3]["failure_details"])
+    assert any(detail["column_name"] == "numeric_salary" and detail["rule_type"] == "DATA_TYPE" for detail in by_row[4]["failure_details"])
+    assert any(detail["column_name"] == "numeric_salary" and detail["rule_type"] == "MIN_VALUE" for detail in by_row[5]["failure_details"])
+    assert any(detail["column_name"] == "department_code" and detail["rule_type"] == "IN_SET" for detail in by_row[6]["failure_details"])
+    assert any(detail["column_name"] == "city_code" and detail["rule_type"] == "IN_SET" for detail in by_row[7]["failure_details"])
+    multi_columns = {detail["column_name"] for detail in by_row[8]["failure_details"]}
+    assert {"required_name", "numeric_age", "numeric_salary", "department_code", "city_code"} <= multi_columns
+    assert not any(detail["column_name"] == "ignored_field" for item in failed for detail in item["failure_details"])
+
+
+def test_same_reason_from_distinct_rules_keeps_each_failure_detail_once():
+    rules = [
+        SimpleNamespace(id=1, dataset_id=None, enabled=True, approved=True, rule_type="EMAIL_FORMAT", column_name="contact", parameters={}),
+        SimpleNamespace(id=2, dataset_id=None, enabled=True, approved=True, rule_type="EMAIL_FORMAT", column_name="contact", parameters={"strict": True}),
+    ]
+
+    passed, failed = validate_records([{"contact": "not-email"}], rules)
+
+    assert passed == []
+    assert failed[0]["failure_reasons"] == ["Invalid contact format: 'not-email' is not a valid email address."]
+    assert [detail["rule_id"] for detail in failed[0]["failure_details"]] == [1, 2]
 
 
 def test_email_rule_resolves_case_and_outer_whitespace_but_keeps_source_key():

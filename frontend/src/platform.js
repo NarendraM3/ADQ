@@ -1,5 +1,22 @@
 /** @typedef {{environment?: string | null, destination?: Record<string, unknown>, settings?: Record<string, unknown>}} PlatformJob */
 
+export function platformKey(value) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  const key = value.trim().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+  return {
+    databricks: 'databricks',
+    snowflake: 'snowflake',
+    fabric: 'fabric',
+    onelake: 'fabric',
+    microsoftfabric: 'fabric',
+    'microsoft fabric': 'fabric',
+  }[key] || '';
+}
+
+export function platformDestinationType(value) {
+  return platformKey(value) || 'local';
+}
+
 /** @param {PlatformJob} job */
 export function displayPlatform(job) {
   const settings = job.settings || {};
@@ -32,7 +49,8 @@ export function getSelectedPlatform() {
 }
 
 export function saveSelectedPlatform(platform) {
-  if (typeof localStorage !== 'undefined' && typeof platform === 'string' && platform.trim()) {
-    localStorage.setItem(SELECTED_PLATFORM_KEY, platform.trim());
+  const label = displayPlatform({ environment: platform });
+  if (typeof localStorage !== 'undefined' && label !== 'Unspecified') {
+    localStorage.setItem(SELECTED_PLATFORM_KEY, label);
   }
 }

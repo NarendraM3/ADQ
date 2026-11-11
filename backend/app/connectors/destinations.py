@@ -11,14 +11,27 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
+from app.config import settings
 from app.connectors.storage import get_storage
 
 
 class DestinationWriteError(RuntimeError):
-    def __init__(self, message, pass_status="failed", fail_status="failed"):
+    def __init__(self, message, pass_status="failed", fail_status="failed", report_status="not_started",
+                 category="destination_persistence_failure"):
         super().__init__(message)
         self.pass_status = pass_status
         self.fail_status = fail_status
+        self.report_status = report_status
+        self.category = category
+
+
+def _safe_error(exc, secrets):
+    """Keep the provider diagnostic while removing any credential values."""
+    message = str(exc).strip() or type(exc).__name__
+    for value in (secrets or {}).values():
+        if isinstance(value, str) and value:
+            message = message.replace(value, "[REDACTED]")
+    return f"{type(exc).__name__}: {message}"
 
 
 def _identifier(value: str) -> str:
@@ -31,6 +44,28 @@ def _column_identifier(value: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError("Column names must be non-empty strings without null bytes")
     return "`" + value.replace("`", "``") + "`"
+
+
+def _execute_tracked(cursor, statement, params=None, metrics=None, phase=None):
+    """Execute one warehouse statement and record its count and blocking time."""
+    started = time.perf_counter()
+    try:
+        return cursor.execute(statement, params) if params is not None else cursor.execute(statement)
+    finally:
+        if metrics is not None:
+            metrics["databricks_query_count"] = metrics.get("databricks_query_count", 0) + 1
+            metrics["databricks_query_seconds"] = metrics.get("databricks_query_seconds", 0.0) + time.perf_counter() - started
+            counts = metrics.setdefault("databricks_statement_counts", {})
+            sql_shape = " ".join(statement.split())
+            # Keep the actual table and DDL in the report while grouping bulk
+            # INSERT parameter cardinalities under one stable SQL shape.
+            if " VALUES " in sql_shape.upper():
+                values_at = sql_shape.upper().index(" VALUES ")
+                sql_shape = sql_shape[:values_at] + " VALUES <parameterized rows>"
+            counts[sql_shape] = counts.get(sql_shape, 0) + 1
+            if phase:
+                phases = metrics.setdefault("databricks_phase_query_counts", {})
+                phases[phase] = phases.get(phase, 0) + 1
 
 
 def _slug(value: str) -> str:
@@ -101,19 +136,23 @@ def _sql_type(values):
     return "STRING"
 
 
-def _write_databricks_table(conn, table, records, columns, extra_columns=()):
+def _write_databricks_table(conn, table, records, columns, extra_columns=(), *,
+                            progress_callback=None, phase=None, batch_size=None, metrics=None):
+    phase_started = time.perf_counter()
     cursor = conn.cursor()
     try:
+        column_types = {col: _sql_type([(r.get('record', r)).get(col) for r in records]) for col in columns}
         definitions = []
         for col in columns:
-            definitions.append(f"{_column_identifier(col)} {_sql_type([(r.get('record', r)).get(col) for r in records])}")
+            definitions.append(f"{_column_identifier(col)} {column_types[col]}")
         for col, typ in extra_columns:
             definitions.append(f"`{_identifier(col)}` {typ}")
         if not definitions:
             definitions = ["`_empty_result` STRING"]
-        cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(definitions)}) USING DELTA")
+        _execute_tracked(cursor, f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(definitions)}) USING DELTA "
+                       "TBLPROPERTIES ('delta.columnMapping.mode' = 'name')", metrics=metrics, phase=phase)
         # Tables are unique to a run; clearing the same run makes retries idempotent.
-        cursor.execute(f"DELETE FROM {table}")
+        _execute_tracked(cursor, f"DELETE FROM {table}", metrics=metrics, phase=phase)
         if records:
             insert_cols = list(columns) + [c for c, _ in extra_columns]
             marks = ", ".join("?" for _ in insert_cols)
@@ -130,13 +169,38 @@ def _write_databricks_table(conn, table, records, columns, extra_columns=()):
                            json.dumps(record.get("failure_reasons"), ensure_ascii=False) if c == "_dq_failure_reasons" and record.get("failure_reasons") is not None else
                            record.get("_dq_failure_reasons") if c == "_dq_failure_reasons" else record.get(c))
                            for c, _ in extra_columns))
-            cursor.executemany(f"INSERT INTO {table} ({names}) VALUES ({marks})", values)
-        cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            # The connector implements executemany as one warehouse statement
+            # per parameter set. Use bounded multi-row VALUES statements so a
+            # 1,000-row result needs a handful of round trips instead.
+            width = max(1, len(insert_cols))
+            configured_batch = batch_size or int(settings.destination_insert_batch_size)
+            batch_size = max(1, min(configured_batch, 10000 // width))
+            if progress_callback:
+                progress_callback({"phase": phase, "completed": 0, "total": len(values)})
+            insert_types = [column_types[col] for col in columns] + [typ for _, typ in extra_columns]
+            # Explicit casts keep Databricks from inferring incompatible inline
+            # VALUES column types when source rows mix strings, numbers, and NULL.
+            row_marks = "(" + ", ".join(f"CAST(? AS {typ})" for typ in insert_types) + ")"
+            for offset in range(0, len(values), batch_size):
+                batch = values[offset:offset + batch_size]
+                placeholders = ", ".join(row_marks for _ in batch)
+                params = tuple(value for row in batch for value in row)
+                _execute_tracked(cursor, f"INSERT INTO {table} ({names}) VALUES {placeholders}", params,
+                                 metrics=metrics, phase=phase)
+                milestone = min(100, ((offset + len(batch)) * 100) // len(values))
+                previous_milestone = (offset * 100) // len(values)
+                if progress_callback and (metrics and metrics.get("fine_grained_progress") or
+                                          milestone == 100 or milestone // 10 > previous_milestone // 10):
+                    progress_callback({"phase": phase, "completed": offset + len(batch), "total": len(values)})
+        _execute_tracked(cursor, f"SELECT COUNT(*) FROM {table}", metrics=metrics, phase=phase)
         count_row = cursor.fetchone()
         if not count_row or count_row[0] != len(records):
             raise RuntimeError("Databricks row count did not match the submitted records")
     finally:
         cursor.close()
+        if metrics is not None and phase:
+            phase_times = metrics.setdefault("databricks_phase_seconds", {})
+            phase_times[phase] = phase_times.get(phase, 0.0) + time.perf_counter() - phase_started
 
 
 def _write_databricks_tables_atomically(conn, table_rows):
@@ -146,10 +210,18 @@ def _write_databricks_tables_atomically(conn, table_rows):
     backups = []
     replaced = []
     try:
-        for target, records, columns, extra_columns in table_rows:
+        for phase, (target, records, columns, extra_columns) in zip(("PASS", "FAIL"), table_rows):
             stage = target[:-1] + f"__stage_{token}`"
             backup = target[:-1] + f"__backup_{token}`"
-            _write_databricks_table(conn, stage, records, columns, extra_columns)
+            try:
+                _write_databricks_table(conn, stage, records, columns, extra_columns)
+            except Exception as exc:
+                diagnostic = _safe_error(exc, {})
+                # The driver includes the entire INSERT statement after this
+                # marker. Keep logs complete, but don't echo row data in API errors.
+                diagnostic = diagnostic.split("\n== SQL", 1)[0][:500]
+                raise DestinationWriteError(f"Databricks {phase} staging write failed: {diagnostic}",
+                                            category="sql_execution_failure") from exc
             staged.append(stage)
             cursor = conn.cursor()
             try:
@@ -186,7 +258,8 @@ def _write_databricks_tables_atomically(conn, table_rows):
 
 
 def _write_databricks(destination, secrets, passed, failed, dataset_name, job_id, execution_id, source_columns=None,
-                      source_dataset_ids=None, storage_run_id=None, passed_row_indices=None, atomic_update=False):
+                      source_dataset_ids=None, storage_run_id=None, passed_row_indices=None, atomic_update=False,
+                      report=None, progress_callback=None, performance_metrics=None):
     try:
         from databricks import sql
     except ImportError as e:
@@ -198,6 +271,7 @@ def _write_databricks(destination, secrets, passed, failed, dataset_name, job_id
     table_run_id = storage_run_id or execution_id
     passed_table = _table_name(safe_dataset, job_id, table_run_id, "pass")
     failed_table = _table_name(safe_dataset, job_id, table_run_id, "fail")
+    report_table = _table_name(safe_dataset, job_id, table_run_id, "report")
     qualified = lambda table: f"`{catalog}`.`{schema}`.`{table}`"
     columns = list(source_columns or dict.fromkeys(k for row in passed for k in row))
     failed_columns = columns
@@ -208,6 +282,7 @@ def _write_databricks(destination, secrets, passed, failed, dataset_name, job_id
         raise ValueError("Databricks requires server_hostname, http_path, and access_token")
     server_hostname = server_hostname.removeprefix("https://").removeprefix("http://").rstrip("/")
     _bypass_proxy_for_host(server_hostname)
+    connect_started = time.perf_counter()
     conn = sql.connect(server_hostname=server_hostname, http_path=http_path,
                        access_token=access_token, catalog=catalog, schema=schema,
                        # The connector defaults to 30 retries over 15 minutes.
@@ -215,14 +290,25 @@ def _write_databricks(destination, secrets, passed, failed, dataset_name, job_id
                        # users watching an execution with no persisted results.
                        # Keep a short retry window for transient failures, then let
                        # execute() persist validation counts and a FAILED status.
-                       _retry_stop_after_attempts_count=3,
-                       _retry_stop_after_attempts_duration=30)
+                       _retry_stop_after_attempts_count=max(1, int(settings.destination_retry_attempts)),
+                       _retry_stop_after_attempts_duration=max(1, int(settings.destination_statement_timeout_seconds)),
+                       _socket_timeout=max(1, int(settings.destination_statement_timeout_seconds)),
+                       session_configuration={"STATEMENT_TIMEOUT": str(max(1, int(settings.destination_statement_timeout_seconds)))},
+                       query_tags={"dq_job_id": str(job_id), "dq_execution_id": str(execution_id),
+                                   "dq_component": "destination_persistence"})
+    if performance_metrics is not None:
+        performance_metrics["databricks_connection_openings"] = performance_metrics.get("databricks_connection_openings", 0) + 1
+        performance_metrics["databricks_connection_open_seconds"] = performance_metrics.get("databricks_connection_open_seconds", 0.0) + time.perf_counter() - connect_started
     try:
+        if progress_callback:
+            progress_callback({"phase": "prepare", "completed": 0, "total": 1})
         cur = conn.cursor()
         try:
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
+            _execute_tracked(cur, f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", metrics=performance_metrics, phase="prepare")
         finally:
             cur.close()
+        if progress_callback:
+            progress_callback({"phase": "prepare", "completed": 1, "total": 1})
         metadata_values = {"_dq_job_id": job_id, "_dq_execution_id": execution_id,
                            "_dq_source_dataset_ids": json.dumps(source_dataset_ids or []),
                            "_dq_validation_status": None, "_dq_row_index": None,
@@ -264,15 +350,35 @@ def _write_databricks(destination, secrets, passed, failed, dataset_name, job_id
             ])
         else:
             try:
-                _write_databricks_table(conn, qualified(passed_table), pass_rows, columns, metadata)
+                _write_databricks_table(conn, qualified(passed_table), pass_rows, columns, metadata,
+                                        progress_callback=progress_callback, phase="pass", metrics=performance_metrics)
             except Exception as exc:
-                raise DestinationWriteError(type(exc).__name__) from exc
+                raise DestinationWriteError(_safe_error(exc, secrets)) from exc
             try:
-                _write_databricks_table(conn, qualified(failed_table), fail_rows, failed_columns, metadata)
+                _write_databricks_table(conn, qualified(failed_table), fail_rows, failed_columns, metadata,
+                                        progress_callback=progress_callback, phase="fail", metrics=performance_metrics)
             except Exception as exc:
-                raise DestinationWriteError(type(exc).__name__, pass_status="saved") from exc
+                raise DestinationWriteError(_safe_error(exc, secrets), pass_status="saved") from exc
+        try:
+            report_table_location = f"{catalog}.{schema}"
+            stored_report = dict(report or {})
+            stored_report["storage_status"] = {"destination_platform":"databricks",
+                "destination_location":report_table_location,"status":"saved",
+                "pass_storage_status":"saved","fail_storage_status":"saved",
+                "report_storage_status":"saved","error_message":None}
+            stored_report["destination_result"] = {"type":"databricks","status":"saved",
+                "pass_status":"saved","fail_status":"saved","report_status":"saved",
+                "passed_table":passed_table,"failed_table":failed_table,"report_table":report_table}
+            report_record = {"_dq_report_json": json.dumps(stored_report, ensure_ascii=False, default=str)}
+            _write_databricks_table(conn, qualified(report_table), [report_record], ["_dq_report_json"],
+                                    progress_callback=progress_callback, phase="report", metrics=performance_metrics)
+        except Exception as exc:
+            raise DestinationWriteError(_safe_error(exc, secrets), pass_status="saved", fail_status="saved",
+                                        report_status="failed") from exc
         return {"type": "databricks", "status": "saved", "pass_status": "saved", "fail_status": "saved",
-                "catalog": catalog, "schema": schema, "passed_table": passed_table, "failed_table": failed_table}
+                "report_status": "saved", "destination_location": f"{catalog}.{schema}",
+                "catalog": catalog, "schema": schema, "passed_table": passed_table,
+                "failed_table": failed_table, "report_table": report_table}
     finally:
         conn.close()
 
@@ -348,38 +454,77 @@ def _write_with_retry(operation, attempts=3):
 def _write_object_storage(provider, destination, secrets, base, passed, failed, report, passed_csv):
     storage = get_storage(provider, destination, secrets)
     passed_key, failed_key = f"{base}/passed.csv", f"{base}/failed.json"
+    failed_bytes = json.dumps(failed, ensure_ascii=False, indent=2).encode()
+    def save_verified(key, payload):
+        location = storage.save(key, payload)
+        persisted = storage.read(key)
+        if persisted != payload:
+            raise RuntimeError(f"Destination read-back verification failed for {key}")
+        return location
     try:
-        passed_path = _write_with_retry(lambda: storage.save(passed_key, passed_csv))
+        passed_path = _write_with_retry(lambda: save_verified(passed_key, passed_csv))
     except Exception as exc:
-        raise DestinationWriteError(type(exc).__name__) from exc
+        raise DestinationWriteError(_safe_error(exc, secrets)) from exc
     try:
-        failed_path = _write_with_retry(lambda: storage.save(
-            failed_key, json.dumps(failed, ensure_ascii=False, indent=2).encode()))
+        failed_path = _write_with_retry(lambda: save_verified(failed_key, failed_bytes))
     except Exception as exc:
-        raise DestinationWriteError(type(exc).__name__, pass_status="saved") from exc
+        raise DestinationWriteError(_safe_error(exc, secrets), pass_status="saved") from exc
+    location = _destination_location(provider, destination)
     result = {"type": provider, "status": "saved", "pass_status": "saved", "fail_status": "saved",
-              "passed": passed_path, "failed": failed_path}
+              "destination_location": location, "passed": passed_path, "failed": failed_path,
+              "report_status": "not_started"}
     report["destination_result"] = {"type": provider, "status": "saved", "outputs": result}
     try:
-        result["report"] = storage.save(f"{base}/report.json", json.dumps(report, indent=2).encode())
+        report["storage_status"] = {"destination_platform": provider,
+            "destination_location": location,
+            "status": "saved", "pass_storage_status": "saved", "fail_storage_status": "saved",
+            "report_storage_status": "pending", "error_message": None}
+        result["report"] = _write_with_retry(lambda: save_verified(f"{base}/report.json", json.dumps(report, indent=2).encode()))
         result["report_status"] = "saved"
-    except Exception:
-        result["report_status"] = "failed"
+        report["storage_status"]["report_storage_status"] = "saved"
+        result["report"] = _write_with_retry(lambda: save_verified(f"{base}/report.json", json.dumps(report, indent=2).encode()))
+    except Exception as exc:
+        raise DestinationWriteError(_safe_error(exc, secrets), pass_status="saved",
+                                    fail_status="saved", report_status="failed") from exc
     return result
+
+
+def _destination_location(provider, destination):
+    if provider == "databricks":
+        return ".".join(str(destination.get(key, "")) for key in ("catalog", "schema") if destination.get(key)) or None
+    if provider == "s3":
+        return f"s3://{destination.get('bucket', '')}".rstrip("/")
+    if provider == "azure_blob":
+        return f"azure://{destination.get('container', '')}"
+    if provider in {"onelake", "fabric"}:
+        return f"onelake://{destination.get('workspace_id', destination.get('workspace', ''))}/{destination.get('lakehouse_id', destination.get('lakehouse', ''))}"
+    if provider == "snowflake":
+        return ".".join(str(destination.get(key, "")) for key in ("database", "schema") if destination.get(key)) or None
+    return provider
 
 
 def write_destination(destination: dict, secrets: dict, base: str, passed: list, failed: list,
                       report: dict, passed_csv: bytes, *, dataset_name="dataset", job_id=0, execution_id=0,
                       columns=None, source_dataset_ids=None, storage_run_id=None, passed_row_indices=None,
-                      atomic_update=False):
+                      atomic_update=False, progress_callback=None, performance_metrics=None):
     provider = destination.get("type", "local")
     if provider == "local":
         return {"type": "local", "status": "saved", "pass_status": "saved", "fail_status": "saved"}
     if provider == "databricks":
-        return _write_with_retry(lambda: _write_databricks(destination, secrets, passed, failed,
-                                                           dataset_name, job_id, execution_id, columns,
-                                                           source_dataset_ids, storage_run_id,
-                                                           passed_row_indices, atomic_update))
+        attempts = max(1, int(settings.destination_retry_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                return _write_databricks(destination, secrets, passed, failed,
+                                         dataset_name, job_id, execution_id, columns,
+                                         source_dataset_ids, storage_run_id,
+                                         passed_row_indices, atomic_update, report, progress_callback,
+                                         performance_metrics)
+            except Exception:
+                if attempt == attempts:
+                    raise
+                if progress_callback:
+                    progress_callback({"phase": "retry", "attempt": attempt + 1, "completed": 0, "total": 0})
+                time.sleep(0.1 * (2 ** (attempt - 1)))
     if provider in ("s3", "azure_blob", "onelake"):
         return _write_object_storage(provider, destination, secrets, base, passed, failed, report, passed_csv)
     if provider == "fabric":

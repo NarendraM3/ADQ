@@ -1,15 +1,24 @@
-﻿import csv, io, json
+﻿import csv, io, json, re
 from datetime import datetime, timezone
 from pathlib import Path
 import logging
+from time import perf_counter
 from types import SimpleNamespace
 from sqlalchemy import or_, select, update
-from app.config import settings
 from app.connectors.storage import LocalStorage
 from app.connectors.destinations import write_destination
+from app.platforms import destination_for_job, resolve_destination_credentials
 from app.database import SessionLocal
-from app.models import Credential, Dataset, Execution, Job, Rule
+from app.models import Dataset, Execution, Job, Rule
 from app.rules import is_missing, rule_signature, validate_records
+from app.serialization import json_safe
+
+
+def _safe_error_message(exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    message = re.sub(r"(?i)(access[_-]?key|api[_-]?key|token|password|secret|authorization)(\s*[=:]\s*)[^\s,;]+",
+                     r"\1\2[REDACTED]", message)
+    return message[:1500]
 
 
 def parse_data(filename: str, content: bytes):
@@ -27,13 +36,22 @@ def parse_data(filename: str, content: bytes):
             raise ValueError("JSON must be an array of objects or an object with a records array")
         return value
     if suffix in (".xlsx", ".xls"):
-        try:
-            from openpyxl import load_workbook
-            workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        except ImportError as e:
-            raise ValueError("Excel support requires openpyxl") from e
-        sheet = workbook.active
-        rows = sheet.iter_rows(values_only=True)
+        if suffix == ".xls":
+            try:
+                import xlrd
+                workbook = xlrd.open_workbook(file_contents=content, on_demand=True)
+            except ImportError as e:
+                raise ValueError("Legacy XLS support requires xlrd") from e
+            sheet = workbook.sheet_by_index(0)
+            rows = (sheet.row_values(index) for index in range(sheet.nrows))
+        else:
+            try:
+                from openpyxl import load_workbook
+                workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            except ImportError as e:
+                raise ValueError("XLSX support requires openpyxl") from e
+            sheet = workbook.active
+            rows = sheet.iter_rows(values_only=True)
         raw_headers = list(next(rows, []))
         data_rows = list(rows)
         headers = []
@@ -130,7 +148,9 @@ def validate_union_records(record_sets, datasets, rules):
     global_rules = [rule for rule in rules if rule.dataset_id is None]
     if global_rules:
         _, global_failures = validate_records(records, global_rules)
-        failures.update({item["row_index"]: list(item["failure_reasons"]) for item in global_failures})
+        failures.update({item["row_index"]: {"reasons": list(item["failure_reasons"]),
+                                             "details": list(item.get("failure_details", []))}
+                         for item in global_failures})
     offset = 0
     for dataset, rows in zip(datasets, record_sets):
         scoped_rules = [rule for rule in rules if rule.dataset_id == dataset.id]
@@ -138,48 +158,56 @@ def validate_union_records(record_sets, datasets, rules):
             _, scoped_failures = validate_records(rows, scoped_rules)
             for item in scoped_failures:
                 index = offset + item["row_index"]
-                reasons = failures.setdefault(index, [])
-                reasons.extend(reason for reason in item["failure_reasons"] if reason not in reasons)
+                failure = failures.setdefault(index, {"reasons": [], "details": []})
+                failure["reasons"].extend(reason for reason in item["failure_reasons"] if reason not in failure["reasons"])
+                existing_detail_reasons = {detail.get("reason") for detail in failure["details"]}
+                failure["details"].extend(detail for detail in item.get("failure_details", [])
+                                          if detail.get("reason") not in existing_detail_reasons)
         offset += len(rows)
     passed, failed = [], []
     for index, record in enumerate(records):
-        reasons = failures.get(index, [])
-        if reasons:
-            failed.append({"row_index": index, "record": record, "failure_reasons": reasons})
+        failure = failures.get(index)
+        if failure:
+            failed.append({"row_index": index, "record": record,
+                           "failure_reasons": failure["reasons"],
+                           "failure_details": failure["details"]})
         else:
             passed.append(record)
     return passed, failed
 
 
-def destination_for_job(job):
-    """Resolve a job's persisted output destination without credential based fallback."""
-    destination = dict(job.destination or {"type": "local"})
-    if destination.get("type", "local") == "local":
-        settings_snapshot = job.settings if isinstance(job.settings, dict) else {}
-        saved_platform = job.environment or settings_snapshot.get("environment") or settings_snapshot.get("platform")
-        key = " ".join(str(saved_platform or "").strip().lower().replace("_", " ").split())
-        platform_type = {"databricks": "databricks", "snowflake": "snowflake",
-                         "fabric": "fabric", "microsoft fabric": "fabric", "onelake": "fabric"}.get(key)
-        if platform_type:
-            destination["type"] = platform_type
-    return destination
-
-
 def execute(execution_id: int):
     db = SessionLocal()
+    execution_started = perf_counter()
+    timings = {"source_connection_seconds": 0.0, "dataset_retrieval_seconds": 0.0,
+               "rule_evaluation_seconds": 0.0, "pass_persistence_seconds": 0.0,
+               "fail_persistence_seconds": 0.0, "pass_fail_persistence_seconds": 0.0}
+    databricks_metrics = {"databricks_query_count": 0, "databricks_connection_openings": 0,
+                          "databricks_query_seconds": 0.0, "databricks_connection_open_seconds": 0.0,
+                          "databricks_statement_counts": {}, "databricks_phase_query_counts": {},
+                          "databricks_phase_seconds": {}}
     try:
         # Claim queued work atomically. A duplicate task (or startup recovery
         # racing the original request) must never execute the same run twice.
         claimed = db.execute(update(Execution).where(
             Execution.id == execution_id, Execution.status == "queued"
         ).values(status="running", started_at=datetime.now(timezone.utc),
-                 logs=["Execution started"]))
+                 stage="starting", updated_at=datetime.now(timezone.utc), logs=["Execution started"]))
         db.commit()
         if claimed.rowcount != 1:
             return
         execution = db.get(Execution, execution_id)
         if execution is None:
             raise ValueError(f"Execution {execution_id} does not exist")
+        def progress(stage, completed=None, total=None):
+            execution.stage = stage
+            if completed is not None:
+                execution.progress_completed = max(0, int(completed))
+            if total is not None:
+                execution.progress_total = max(0, int(total))
+            execution.updated_at = datetime.now(timezone.utc)
+            db.commit()
+        progress("reading_dataset", 0, 0)
         job = db.get(Job, execution.job_id)
         if job is None:
             raise ValueError(f"Job for execution {execution_id} does not exist")
@@ -190,7 +218,12 @@ def execute(execution_id: int):
         if any(d is None for d in datasets): raise ValueError("Job references a missing dataset")
         if len(datasets) > 2 and (job.settings or {}).get("combine_mode") != "union": raise ValueError("A join can combine up to two datasets")
         local = LocalStorage()
+        retrieval_started = perf_counter()
+        # Read each selected source exactly once per execution. LocalStorage
+        # files are already the materialized source snapshot, so there is no
+        # additional Databricks round trip during validation.
         record_sets = [parse_data(d.filename, local.read(d.path)) for d in datasets]
+        timings["dataset_retrieval_seconds"] = perf_counter() - retrieval_started
         # Refresh persisted schema metadata from the selected source bytes so a
         # previous import's stale/synthetic columns do not survive execution.
         for dataset, rows in zip(datasets, record_sets):
@@ -274,32 +307,67 @@ def execute(execution_id: int):
         disabled_count = sum(not bool(r.enabled) for r in rules)
         skipped_count = sum(not (r.enabled and r.approved) for r in rules)
         if executed_count:
+            progress("validating_records", 0, len(records))
+            evaluation_started = perf_counter()
             if (job.settings or {}).get("combine_mode") == "union" and len(record_sets) > 1:
                 passed, failed = validate_union_records(record_sets, datasets, active_rules)
             else:
                 passed, failed = validate_records(records, active_rules)
+            timings["rule_evaluation_seconds"] = perf_counter() - evaluation_started
         else:
             # No executed rules means no record has been evaluated. Do not
             # classify the untouched input rows as passing.
             passed, failed = [], []
+        # Connector outputs can include dataframe rows and NumPy/Pandas
+        # scalars. Normalize both result branches before any local/cloud write.
+        passed = json_safe(passed)
+        failed = json_safe(failed)
+        if executed_count:
+            progress("saving_pass_records", len(records), len(records))
+        persistence_started = perf_counter()
         validation_complete = executed_count > 0
         base = f"outputs/job-{job.id}/execution-{execution.id}"
         dest = LocalStorage()
         passed_path = dest.save(base + "/passed.csv", encode_csv(passed))
-        failed_path = dest.save(base + "/failed.json", json.dumps(failed, ensure_ascii=False, indent=2).encode())
+        passed_records_path = dest.save(base + "/passed.json",
+            json.dumps(json_safe(passed), ensure_ascii=False, indent=2, allow_nan=False).encode())
+        failed_path = dest.save(base + "/failed.json", json.dumps(failed, ensure_ascii=False, indent=2, allow_nan=False).encode())
+        timings["pass_fail_persistence_seconds"] = perf_counter() - persistence_started
         report = {"execution_id": execution.id, "job_id": job.id,
             "status": "succeeded" if validation_complete else "incomplete", "validation_complete": validation_complete,
             "total": len(records) if validation_complete else 0,
             "records_loaded": len(records), "records_evaluated": len(records) if validation_complete else 0,
             "passed": len(passed), "failed": len(failed),
             "rules": {"executed": executed_count, "pending": pending_count, "disabled": disabled_count, "skipped": skipped_count},
+            "quality_checks": [{"id": rule.id, "dataset_id": rule.dataset_id,
+                "column_name": rule.column_name, "rule_type": rule.rule_type,
+                "parameters": rule.parameters or {}, "enabled": bool(rule.enabled),
+                "approved": bool(rule.approved)} for rule in active_rules],
             "passed_path": passed_path, "failed_path": failed_path,
+            "passed_records_path": passed_records_path,
+            "timings_seconds": {**timings, "total_execution_seconds": perf_counter() - execution_started},
             "destination": destination.get("type", "local"),
-            "storage_status": {"status": "not_started", "pass_status": "not_started", "fail_status": "not_started"},
+            "storage_status": {"destination_platform": destination.get("type", "local"),
+                "destination_location": destination.get("catalog") and f"{destination.get('catalog')}.{destination.get('schema', '')}" or None,
+                "status": "not_started", "pass_storage_status": "not_started",
+                "fail_storage_status": "not_started", "report_storage_status": "not_started",
+                "error_message": None},
             "generated_at": datetime.now(timezone.utc).isoformat()}
+        if validation_complete:
+            # Checkpoint validation artifacts before contacting the destination.
+            # A process crash during a remote write must not erase calculated
+            # counts or the local report needed for a safe storage retry.
+            report["validation_status"] = "succeeded"
+            report["storage_status"]["status"] = "pending"
+            report_path = dest.save(base + "/report.json", json.dumps(json_safe(report), indent=2, allow_nan=False).encode())
+            execution.passed_count = len(passed)
+            execution.failed_count = len(failed)
+            execution.report_path = report_path
+            progress("saving_pass_records", 0, len(passed))
+            db.commit()
         if not validation_complete:
             report["message"] = "Validation incomplete: approve and enable at least one applicable rule, then run validation again. Records were not validated."
-            report_path = dest.save(base + "/report.json", json.dumps(report, indent=2).encode())
+            report_path = dest.save(base + "/report.json", json.dumps(json_safe(report), indent=2, allow_nan=False).encode())
             execution.status = "incomplete"
             execution.passed_count = execution.failed_count = 0
             execution.report_path = report_path
@@ -311,91 +379,155 @@ def execute(execution_id: int):
             return
         output_columns=list(dict.fromkeys(k for row in passed for k in row))
         output_schema={"columns":{c:{"inferred_type":"string","nullable":any(is_missing(r.get(c)) for r in passed)} for c in output_columns},"row_count":len(passed)}
-        output_dataset=Dataset(name=f"{job.name} output {execution.id}",filename="passed.csv",path=passed_path,source_type="derived",schema_json=output_schema)
-        db.add(output_dataset); db.flush()
+        output_dataset=db.scalar(select(Dataset).where(Dataset.path==passed_path, Dataset.source_type=="derived"))
+        if output_dataset is None:
+            output_dataset=Dataset(name=f"{job.name} output {execution.id}",filename="passed.csv",path=passed_path,
+                                   source_type="derived",schema_json=output_schema)
+            db.add(output_dataset)
+        else:
+            output_dataset.name=f"{job.name} output {execution.id}"
+            output_dataset.schema_json=output_schema
+        db.flush()
         report["output_dataset_id"] = output_dataset.id
+        report_path = dest.save(base + "/report.json", json.dumps(json_safe(report), indent=2, allow_nan=False).encode())
+        execution.report_path = report_path
+        db.commit()
         provider=destination.get("type","local")
-        secrets={}
-        if provider != "local":
-            credential_id=destination.get("credential_id")
-            credential=db.get(Credential,credential_id) if credential_id else None
-            if credential:
-                from cryptography.fernet import Fernet
-                if not settings.secret_encryption_key: raise ValueError("SECRET_ENCRYPTION_KEY is required for encrypted cloud credentials")
-                secrets=json.loads(Fernet(settings.secret_encryption_key.encode()).decrypt(credential.secret_ciphertext.encode()))
-                destination={**(credential.config or {}),**destination}
-            elif provider == "databricks":
-                # Databricks output may use the documented environment configuration;
-                # credentials remain in process memory and are never written to the report.
-                destination={**destination,
-                    "server_hostname": destination.get("server_hostname") or settings.databricks_server_hostname,
-                    "http_path": destination.get("http_path") or settings.databricks_http_path,
-                    "catalog": destination.get("catalog") or settings.databricks_catalog,
-                    "schema": destination.get("schema") or settings.databricks_schema}
-                secrets={"access_token": settings.databricks_token} if settings.databricks_token else {}
-                if not destination.get("server_hostname") or not destination.get("http_path") or not secrets.get("access_token"):
-                    raise ValueError("Databricks destination requires DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, and DATABRICKS_TOKEN, or a saved Databricks credential")
-            else:
-                raise ValueError(f"Destination {provider} requires credential_id")
-            compatible={"s3":"s3","azure_blob":"azure_blob","onelake":"onelake","fabric":"fabric","snowflake":"snowflake","databricks":"databricks"}
-            if credential and compatible.get(provider) != credential.provider: raise ValueError(f"Credential provider {credential.provider} does not match destination {provider}")
+        destination,secrets=resolve_destination_credentials(destination, db)
         dataset_label = "_and_".join(d.name for d in datasets)
         storage_run_id = execution.id
         retry_parent = db.get(Execution, execution.retry_of) if execution.retry_of else None
         while retry_parent:
             storage_run_id = retry_parent.id
             retry_parent = db.get(Execution, retry_parent.retry_of) if retry_parent.retry_of else None
+        destination_started = None
         try:
             failed_indices = {item["row_index"] for item in failed}
             passed_row_indices = [index for index in range(len(records)) if index not in failed_indices]
+            def destination_progress(info):
+                phase = info.get("phase")
+                stage = {"pass": "saving_pass_records", "fail": "saving_fail_records",
+                         "report": "saving_report", "prepare": "saving_pass_records"}.get(phase)
+                if stage:
+                    progress(stage, info.get("completed", 0), info.get("total", 0))
+            destination_started = perf_counter()
             remote=write_destination(destination,secrets,base,passed,failed,report,encode_csv(passed),
                 dataset_name=dataset_label,job_id=job.id,execution_id=execution.id,
                 columns=list(dict.fromkeys(k for row in records for k in row)),
                 source_dataset_ids=[dataset.id for dataset in datasets], storage_run_id=storage_run_id,
-                passed_row_indices=passed_row_indices)
+                passed_row_indices=passed_row_indices, progress_callback=destination_progress,
+                performance_metrics=databricks_metrics)
+            timings["pass_fail_persistence_seconds"] += perf_counter() - destination_started
+            destination_started = None
             report["destination_result"]=remote
-            report["storage_status"]={"status":"saved","pass_status":remote.get("pass_status","saved"),
-                                      "fail_status":remote.get("fail_status","saved")}
+            report["storage_status"]={"destination_platform": provider,
+                "destination_location": remote.get("destination_location") or remote.get("catalog") and f"{remote.get('catalog')}.{remote.get('schema', '')}" or None,
+                "status":"saved","pass_storage_status":remote.get("pass_status","saved"),
+                "fail_storage_status":remote.get("fail_status","saved"),
+                "report_storage_status":remote.get("report_status", "saved"), "error_message":None}
+            report["storage_status"]["pass_status"] = report["storage_status"]["pass_storage_status"]
+            report["storage_status"]["fail_status"] = report["storage_status"]["fail_storage_status"]
+            if report["storage_status"]["report_storage_status"] != "saved":
+                report["storage_status"]["status"] = "failed"
+                report["storage_status"]["error_message"] = "Destination report was not confirmed written"
         except Exception as storage_error:
-            # Validation remains successful when its independent output write fails.
-            report["storage_status"]={"status":"failed","pass_status":getattr(storage_error,"pass_status","failed"),
-                                      "fail_status":getattr(storage_error,"fail_status","failed"),
-                                      "error":str(storage_error) or type(storage_error).__name__}
+            if destination_started is not None:
+                timings["pass_fail_persistence_seconds"] += perf_counter() - destination_started
+            storage_message = _safe_error_message(storage_error)
+            report["storage_status"]={"destination_platform":provider,
+                "destination_location": destination.get("catalog") and f"{destination.get('catalog')}.{destination.get('schema', '')}" or None,
+                "status":"failed","pass_storage_status":getattr(storage_error,"pass_status","failed"),
+                "fail_storage_status":getattr(storage_error,"fail_status","failed"),
+                "report_storage_status":getattr(storage_error,"report_status","not_started"),
+                "error_message":storage_message}
+            report["storage_status"]["pass_status"] = report["storage_status"]["pass_storage_status"]
+            report["storage_status"]["fail_status"] = report["storage_status"]["fail_storage_status"]
             report["destination_result"]={"type":provider,"status":"failed",
                 "pass_status":report["storage_status"]["pass_status"],"fail_status":report["storage_status"]["fail_status"],
-                "error":str(storage_error) or type(storage_error).__name__}
+                "error":storage_message}
             report["validation_status"] = "succeeded"
             report["status"] = "failed"
-            logging.getLogger(__name__).error("Execution %s validation succeeded but destination storage failed (%s)",
-                                              execution_id,type(storage_error).__name__)
+            logging.getLogger(__name__).error("Execution %s validation succeeded but destination storage failed: %s",
+                                              execution_id, storage_error, exc_info=True)
         # Persist the final report locally after the real destination operation has completed.
-        report_path = dest.save(base + "/report.json", json.dumps(report, indent=2).encode())
+        timings["pass_persistence_seconds"] += databricks_metrics.get("databricks_phase_seconds", {}).get("pass", 0.0)
+        timings["fail_persistence_seconds"] += databricks_metrics.get("databricks_phase_seconds", {}).get("fail", 0.0)
+        report["timings_seconds"] = {**timings,
+            "total_execution_seconds": perf_counter() - execution_started}
+        report["performance_metrics"] = databricks_metrics
+        report_path = dest.save(base + "/report.json", json.dumps(json_safe(report), indent=2, allow_nan=False).encode())
         storage_succeeded = report["storage_status"]["status"] == "saved"
         report["validation_status"] = "succeeded"
         execution.status = "succeeded" if storage_succeeded else "failed"
+        execution.stage = "completed" if storage_succeeded else "failed"
+        if storage_succeeded:
+            execution.progress_completed = execution.progress_total
         execution.passed_count = len(passed); execution.failed_count = len(failed)
-        execution.error = "Destination storage failed; see report storage_status" if report["storage_status"]["status"] == "failed" else None
+        execution.error = report["storage_status"].get("error_message") if not storage_succeeded else None
         execution.report_path = report_path; execution.logs = ["Execution started", f"Loaded {len(records)} records",
             f"Executed {executed_count} approved and enabled rules; skipped {pending_count} pending rules; {disabled_count} disabled rules",
             f"Passed {len(passed)}; failed {len(failed)}", "Outputs saved locally",
             f"Destination storage {report['storage_status']['status']}"]
         execution.finished_at = datetime.now(timezone.utc); db.commit()
+        total_seconds = perf_counter() - execution_started
+        timing_message = "Execution timings: " + ", ".join(
+            f"{name}={value:.3f}s" for name, value in {
+                **timings, "total_execution_seconds": total_seconds}.items())
+        execution.logs = (execution.logs or []) + [timing_message]
+        logging.getLogger(__name__).info("Execution %s timings: %s", execution_id,
+            ", ".join(f"{name}={value:.3f}s" for name, value in {
+                **timings, "total_execution_seconds": total_seconds}.items()))
+        db.commit()
     except Exception as exc:
         logging.getLogger(__name__).exception("Execution %s failed", execution_id)
         db.rollback()
         execution = db.get(Execution, execution_id)
         if execution:
-            execution.status = "failed"
-            execution.passed_count = 0
-            execution.failed_count = 0
-            execution.report_path = None
-            if isinstance(exc, ValueError):
-                execution.error = f"Configuration error: {exc}"
-            elif isinstance(exc, KeyError):
-                missing = exc.args[0] if exc.args else "unknown"
-                execution.error = f"Execution failed: required field or configuration key {missing!r} is missing. Check the job configuration and input schema."
+            # Validation outputs are checkpointed before any remote destination
+            # operation. A worker exception after that point must not erase the
+            # already calculated counts or detailed local results.
+            checkpoint = None
+            if execution.report_path:
+                try:
+                    checkpoint = json.loads(LocalStorage().read(execution.report_path))
+                except (OSError, ValueError):
+                    checkpoint = None
+            validation_saved = bool(checkpoint and checkpoint.get("validation_status") == "succeeded")
+            if validation_saved:
+                checkpoint["status"] = "failed"
+                checkpoint["validation_status"] = "succeeded"
+                checkpoint["storage_status"] = {
+                    **(checkpoint.get("storage_status") or {}),
+                    "status": "failed",
+                    "error_message": f"Destination processing stopped ({type(exc).__name__}); validation results remain available.",
+                }
+                checkpoint["destination_result"] = {
+                    **(checkpoint.get("destination_result") or {}),
+                    "status": "failed",
+                    "error": checkpoint["storage_status"]["error_message"],
+                }
+                execution.status = "failed"
+                execution.stage = "failed"
+                execution.error = checkpoint["storage_status"]["error_message"]
+                try:
+                    execution.report_path = LocalStorage().save(
+                        str(Path(execution.report_path).relative_to(LocalStorage().root)),
+                        json.dumps(json_safe(checkpoint), indent=2, allow_nan=False).encode())
+                except (OSError, ValueError):
+                    logging.getLogger(__name__).exception("Could not update checkpoint report for execution %s", execution_id)
             else:
-                execution.error = f"Execution failed ({type(exc).__name__}). Verify the job configuration and connected provider."
+                execution.status = "failed"
+                execution.stage = "failed"
+                execution.passed_count = 0
+                execution.failed_count = 0
+                execution.report_path = None
+                if isinstance(exc, ValueError):
+                    execution.error = f"Configuration error: {exc}"
+                elif isinstance(exc, KeyError):
+                    missing = exc.args[0] if exc.args else "unknown"
+                    execution.error = f"Execution failed: required field or configuration key {missing!r} is missing. Check the job configuration and input schema."
+                else:
+                    execution.error = f"Execution failed ({type(exc).__name__}). Verify the job configuration and connected provider."
             execution.finished_at = datetime.now(timezone.utc)
             execution.logs = (execution.logs or []) + [f"Execution failed with {type(exc).__name__}; see backend logs for the diagnostic."]
             db.commit()

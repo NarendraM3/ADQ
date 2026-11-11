@@ -9,7 +9,7 @@ import pytest
 def test_data_dir():
     """Provide isolated app storage under the workspace for filesystem-restricted runs."""
     workspace = Path(__file__).resolve().parents[1]
-    root = workspace / ".pytest-runtime-data"
+    root = workspace / ".test-runtime-data"
     path = root / uuid4().hex
     path.mkdir(parents=True)
     try:

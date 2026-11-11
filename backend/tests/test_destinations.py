@@ -1,4 +1,5 @@
 from app.connectors.destinations import _bypass_proxy_for_host, _table_name, _write_databricks_table, write_destination
+from app.connectors.storage import _onelake_artifact_path
 
 
 class Cursor:
@@ -7,6 +8,12 @@ class Cursor:
         self.row_count = 0
     def execute(self, statement, params=None):
         self.calls.append((statement, params))
+        if statement.lstrip().upper().startswith("DELETE FROM"):
+            self.row_count = 0
+        elif statement.lstrip().upper().startswith("INSERT INTO"):
+            # Databricks writes use one parameterized multi-row INSERT per batch.
+            # Count those rows just as executemany did before batching was added.
+            self.row_count += statement.count("), (") + 1
     def executemany(self, statement, values):
         values = list(values)
         self.row_count += len(values)
@@ -57,7 +64,8 @@ def test_table_writer_keeps_columns_values_types_and_failure_metadata():
     assert "`user_id` BIGINT" in pass_sql and "`active` BOOLEAN" in pass_sql
     assert "`First Name` STRING" in pass_sql
     assert "DELETE FROM" in pass_sql
-    assert fail_insert[1][0][:6] == (10, "bad", False, "Lin", 1, '["email invalid"]')
+    assert "delta.columnMapping.mode" in pass_sql and "'name'" in pass_sql
+    assert fail_insert[1][:6] == (10, "bad", False, "Lin", 1, '["email invalid"]')
 
 
 def test_table_writer_persists_dynamic_types_and_validation_lineage():
@@ -70,10 +78,23 @@ def test_table_writer_persists_dynamic_types_and_validation_lineage():
               ("_dq_row_index", "BIGINT"), ("_dq_failure_reasons", "STRING"))
     _write_databricks_table(conn, "result_table", rows, ["odd name`field"], extras)
     sql = " ".join(call[0] for call in conn.cursors[0].calls)
-    inserted = conn.cursors[0].calls[-2][1][0]
+    inserted = conn.cursors[0].calls[-2][1]
     assert "`odd name``field` BIGINT" in sql
     assert inserted[:6] == (7, 3, 9, "[4,5]", "PASS", 0)
     assert inserted[6] is None
+
+
+def test_batched_insert_casts_mixed_source_values_to_declared_column_types():
+    conn = Connection()
+    rows = [
+        {"record": {"age": 26, "email": "one@example.test"}},
+        {"record": {"age": "27", "email": "two@example.test"}},
+        {"record": {"age": None, "email": "three@example.test"}},
+    ]
+    _write_databricks_table(conn, "mixed_types", rows, ["age", "email"])
+    insert = next(call[0] for call in conn.cursors[0].calls if call[0].startswith("INSERT INTO"))
+    assert insert.count("CAST(? AS STRING)") == 6
+    assert conn.cursors[0].calls[-2][1] == (26, "one@example.test", "27", "two@example.test", None, "three@example.test")
 
 
 def test_databricks_retries_transient_write_errors(monkeypatch):
@@ -154,9 +175,10 @@ def test_databricks_success_creates_dynamic_tables_and_retry_reuses_them(monkeyp
     assert first["passed_table"] == second["passed_table"]
     assert first["failed_table"] == second["failed_table"]
     assert first["catalog"] == "dq_catalog" and first["schema"] == "dq_schema"
+    assert first["report_status"] == "saved" and first["report_table"].endswith("_report")
     assert all(connection.closed for connection in connections)
     insert = connections[0].cursors[1].calls[-2]
-    assert insert[1][0][0] == 2
+    assert insert[1][0] == 2
     assert "`strange column` BIGINT" in " ".join(call[0] for call in connections[0].cursors[1].calls)
 
 
@@ -184,3 +206,76 @@ def test_databricks_permission_denial_is_not_reported_as_saved(monkeypatch):
         _write_databricks({"server_hostname": "host", "http_path": "path"},
                           {"access_token": "mock-token"}, [], [], "dataset", 1, 2)
     assert connection.closed
+
+
+def test_provider_error_diagnostic_preserves_message_and_redacts_credentials():
+    from app.connectors.destinations import _safe_error
+    error = RuntimeError("request failed using token-123: permission denied")
+    diagnostic = _safe_error(error, {"access_token": "token-123"})
+    assert diagnostic == "RuntimeError: request failed using [REDACTED]: permission denied"
+    assert "token-123" not in diagnostic
+
+
+def test_onelake_guid_artifact_path_does_not_append_lakehouse_suffix():
+    workspace_id = "86ac6ddb-98c1-411b-8881-d491d1b64e2e"
+    lakehouse_id = "3dffb845-a9aa-4f77-83c5-70fc4fded0be"
+
+    assert _onelake_artifact_path(workspace_id, lakehouse_id) == lakehouse_id
+    assert _onelake_artifact_path("Workspace Name", "DQ_lakehouse") == "DQ_lakehouse.Lakehouse"
+    assert _onelake_artifact_path("Workspace Name", "DQ_lakehouse.Lakehouse") == "DQ_lakehouse.Lakehouse"
+
+
+def test_onelake_storage_uses_guid_artifact_id_in_file_paths(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from app.connectors.storage import OneLakeStorage
+    from app.config import settings
+
+    created_dirs = []
+    files = {}
+    class FileClient:
+        def __init__(self, path):
+            self.path = path
+        def create_file(self):
+            files[self.path] = b""
+        def append_data(self, content, offset, length):
+            files[self.path] += content
+        def flush_data(self, length):
+            assert length == len(files[self.path])
+        def download_file(self, **kwargs):
+            return SimpleNamespace(readall=lambda: files[self.path])
+
+    class FileSystemClient:
+        def __init__(self, workspace):
+            self.workspace = workspace
+        def get_directory_client(self, path):
+            created_dirs.append(path)
+            return SimpleNamespace(create_directory=lambda: None)
+        def get_file_client(self, path):
+            return FileClient(path)
+
+    class ServiceClient:
+        def __init__(self, account_url, credential, **kwargs):
+            self.account_url = account_url
+            self.credential = credential
+        def get_file_system_client(self, workspace):
+            assert workspace == "86ac6ddb-98c1-411b-8881-d491d1b64e2e"
+            return FileSystemClient(workspace)
+
+    monkeypatch.setitem(sys.modules, "azure.identity", SimpleNamespace(
+        ClientSecretCredential=lambda tenant, client, secret: ("credential", tenant, client)))
+    monkeypatch.setitem(sys.modules, "azure.storage.filedatalake", SimpleNamespace(
+        DataLakeServiceClient=ServiceClient))
+    monkeypatch.setattr(settings, "onelake_account_url", "https://onelake.dfs.fabric.microsoft.com")
+
+    storage = OneLakeStorage({
+        "workspace_id": "86ac6ddb-98c1-411b-8881-d491d1b64e2e",
+        "lakehouse_id": "3dffb845-a9aa-4f77-83c5-70fc4fded0be",
+        "directory": "dq/outputs",
+    }, {"tenant_id": "tenant", "client_id": "client", "client_secret": "secret"})
+    location = storage.save("outputs/job-5/execution-9/passed.csv", b"ok")
+
+    expected = "3dffb845-a9aa-4f77-83c5-70fc4fded0be/Files/dq/outputs/outputs/job-5/execution-9/passed.csv"
+    assert location == f"onelake://{expected}"
+    assert expected in files
+    assert all(".Lakehouse" not in path for path in created_dirs + list(files))
